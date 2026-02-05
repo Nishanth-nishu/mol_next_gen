@@ -208,11 +208,48 @@ def validate(model, dataloader, device):
 
 
 @torch.no_grad()
-def sample_and_evaluate(model, dataloader, device, num_samples=5):
-    """Sample conformers and compare to ground truth."""
+def kabsch_rmsd(coords_pred: torch.Tensor, coords_true: torch.Tensor) -> float:
+    """
+    Compute RMSD after optimal alignment using Kabsch algorithm.
+    
+    Args:
+        coords_pred: (N, 3) predicted coordinates
+        coords_true: (N, 3) ground truth coordinates
+    
+    Returns:
+        RMSD in Angstroms
+    """
+    # Center both
+    pred_centered = coords_pred - coords_pred.mean(dim=0)
+    true_centered = coords_true - coords_true.mean(dim=0)
+    
+    # Compute optimal rotation using SVD (Kabsch algorithm)
+    H = pred_centered.T @ true_centered  # 3x3
+    U, S, Vt = torch.linalg.svd(H)
+    
+    # Handle reflection case
+    d = torch.det(Vt.T @ U.T)
+    sign_matrix = torch.eye(3, device=coords_pred.device)
+    sign_matrix[2, 2] = d.sign()
+    
+    # Optimal rotation
+    R = Vt.T @ sign_matrix @ U.T
+    
+    # Rotate predicted to align with true
+    pred_aligned = pred_centered @ R.T
+    
+    # Compute RMSD
+    rmsd = torch.sqrt(torch.mean((pred_aligned - true_centered) ** 2)).item()
+    
+    return rmsd
+
+
+@torch.no_grad()
+def sample_and_evaluate(model, dataloader, device, num_samples=10, use_guidance=True):
+    """Sample conformers and compare to ground truth with proper alignment."""
     model.eval()
     
-    total_rmsd = 0
+    rmsds = []
     num_mols = 0
     
     for batch in dataloader:
@@ -225,26 +262,156 @@ def sample_and_evaluate(model, dataloader, device, num_samples=5):
         bond_types = batch['bond_types'].to(device)
         batch_idx = batch['batch_idx'].to(device)
         
-        # Center
+        # Center ground truth
         coords_true = coords_true - scatter_mean(coords_true, batch_idx, dim=0)[batch_idx]
         
-        # Sample
-        coords_gen = model.ddim_sample(
-            atom_types, edge_index, bond_types, batch_idx, num_steps=50
-        )
-        coords_gen = coords_gen - scatter_mean(coords_gen, batch_idx, dim=0)[batch_idx]
+        # Sample using DDIM (with or without guidance)
+        if use_guidance and hasattr(model, 'guided_sample'):
+            coords_gen = model.guided_sample(
+                atom_types, edge_index, bond_types, batch_idx, 
+                num_steps=50, guidance_scale=0.1
+            )
+        else:
+            coords_gen = model.ddim_sample(
+                atom_types, edge_index, bond_types, batch_idx, num_steps=50
+            )
         
-        # RMSD per molecule
+        # Compute RMSD per molecule
         for b in range(batch['num_molecules']):
+            if num_mols >= num_samples:
+                break
+            
             mask = (batch_idx == b)
             c_true = coords_true[mask]
             c_gen = coords_gen[mask]
             
-            rmsd = torch.sqrt(torch.mean((c_true - c_gen) ** 2)).item()
-            total_rmsd += rmsd
+            # Use Kabsch-aligned RMSD
+            rmsd = kabsch_rmsd(c_gen, c_true)
+            rmsds.append(rmsd)
             num_mols += 1
     
-    return total_rmsd / num_mols if num_mols > 0 else 0
+    if rmsds:
+        mean_rmsd = np.mean(rmsds)
+        std_rmsd = np.std(rmsds)
+        return mean_rmsd, std_rmsd
+    
+    return 0.0, 0.0
+
+
+@torch.no_grad()
+def evaluate_3d_validity(model, dataloader, device, num_samples=20):
+    """
+    Evaluate 3D validity of generated conformers.
+    
+    Returns:
+        bond_valid_rate: Fraction of molecules with valid bond lengths
+        clash_free_rate: Fraction of molecules without steric clashes
+        mean_bond_error: Mean deviation from ideal bond lengths
+    """
+    model.eval()
+    
+    bond_errors = []
+    clash_counts = []
+    valid_count = 0
+    clash_free_count = 0
+    total = 0
+    
+    # Expected bond lengths by type
+    IDEAL_BONDS = {1: 1.50, 2: 1.34, 3: 1.20, 4: 1.40}
+    BOND_TOL = 0.3  # Tolerance in Angstroms
+    MIN_NONBOND = 1.4  # Minimum non-bonded distance
+    
+    for batch in dataloader:
+        if total >= num_samples:
+            break
+        
+        atom_types = batch['atom_types'].to(device)
+        edge_index = batch['edge_index'].to(device)
+        bond_types = batch['bond_types'].to(device)
+        batch_idx = batch['batch_idx'].to(device)
+        
+        # Generate using guided sampling
+        if hasattr(model, 'guided_sample'):
+            coords_gen = model.guided_sample(
+                atom_types, edge_index, bond_types, batch_idx,
+                num_steps=50, guidance_scale=0.1
+            )
+        else:
+            coords_gen = model.ddim_sample(
+                atom_types, edge_index, bond_types, batch_idx, num_steps=50
+            )
+        
+        # Evaluate per molecule
+        for b in range(batch['num_molecules']):
+            if total >= num_samples:
+                break
+            
+            mask = (batch_idx == b)
+            coords = coords_gen[mask]
+            N = mask.sum().item()
+            
+            # Get edges for this molecule
+            edge_mask = mask[edge_index[0]] & mask[edge_index[1]]
+            mol_edges = edge_index[:, edge_mask]
+            mol_bond_types = bond_types[edge_mask]
+            
+            # Remap indices to local
+            idx_map = torch.cumsum(mask.long(), 0) - 1
+            local_edges = idx_map[mol_edges]
+            
+            # Check bond lengths
+            mol_valid = True
+            mol_bond_error = 0.0
+            n_bonds = 0
+            
+            for e_idx in range(0, local_edges.size(1), 2):  # Skip duplicates
+                i, j = local_edges[0, e_idx].item(), local_edges[1, e_idx].item()
+                btype = mol_bond_types[e_idx].item()
+                
+                dist = torch.norm(coords[i] - coords[j]).item()
+                ideal = IDEAL_BONDS.get(btype, 1.5)
+                error = abs(dist - ideal)
+                
+                mol_bond_error += error
+                n_bonds += 1
+                
+                if error > BOND_TOL:
+                    mol_valid = False
+            
+            if n_bonds > 0:
+                bond_errors.append(mol_bond_error / n_bonds)
+            if mol_valid:
+                valid_count += 1
+            
+            # Check steric clashes
+            has_clash = False
+            bonded_pairs = set()
+            for e_idx in range(local_edges.size(1)):
+                i, j = local_edges[0, e_idx].item(), local_edges[1, e_idx].item()
+                bonded_pairs.add((min(i, j), max(i, j)))
+            
+            for i in range(N):
+                for j in range(i + 1, N):
+                    if (i, j) not in bonded_pairs:
+                        dist = torch.norm(coords[i] - coords[j]).item()
+                        if dist < MIN_NONBOND:
+                            has_clash = True
+            
+            if not has_clash:
+                clash_free_count += 1
+            
+            total += 1
+    
+    bond_valid_rate = valid_count / total if total > 0 else 0.0
+    clash_free_rate = clash_free_count / total if total > 0 else 0.0
+    mean_bond_error = np.mean(bond_errors) if bond_errors else 0.0
+    
+    return {
+        'bond_valid_rate': bond_valid_rate,
+        'clash_free_rate': clash_free_rate,
+        'mean_bond_error': mean_bond_error,
+        'total_evaluated': total
+    }
 
 
 # =============================================================================
@@ -335,19 +502,31 @@ def main():
         # Validate
         val_loss = validate(model, val_loader, device)
         
-        # Sample RMSD (every 10 epochs)
-        rmsd = 0
+        # Sample and compute RMSD (every 5 epochs for meaningful updates)
+        rmsd_mean, rmsd_std = 0.0, 0.0
+        validity = None
+        
+        if epoch % 5 == 0 or epoch == 1:
+            rmsd_mean, rmsd_std = sample_and_evaluate(model, val_loader, device, num_samples=20)
+        
+        # Evaluate 3D validity (every 10 epochs)
         if epoch % 10 == 0:
-            rmsd = sample_and_evaluate(model, val_loader, device, num_samples=10)
+            validity = evaluate_3d_validity(model, val_loader, device, num_samples=30)
         
         # Log
-        print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, rmsd={rmsd:.3f}Å")
+        log_msg = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
+        if rmsd_mean > 0:
+            log_msg += f", rmsd={rmsd_mean:.3f}±{rmsd_std:.3f}Å"
+        if validity:
+            log_msg += f"\n  → 3D Validity: bonds={validity['bond_valid_rate']*100:.1f}%, no_clash={validity['clash_free_rate']*100:.1f}%, bond_err={validity['mean_bond_error']:.3f}Å"
+        print(log_msg)
         
         history.append({
             'epoch': epoch,
             'train_loss': train_loss,
             'val_loss': val_loss,
-            'rmsd': rmsd,
+            'rmsd_mean': rmsd_mean,
+            'rmsd_std': rmsd_std,
             'lr': scheduler.get_last_lr()[0]
         })
         

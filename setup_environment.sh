@@ -100,11 +100,11 @@ echo "Python: $(which python)"
 # ============================================================================
 echo ""
 echo "============================================================================"
-echo "Step 4: Installing PyTorch with CUDA..."
+echo "Step 4: Installing PyTorch with CUDA 12.4..."
 echo "============================================================================"
 
-# Install PyTorch (CUDA 11.8 version - adjust if needed)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Install PyTorch with CUDA 12.4 (compatible with CUDA 12.8)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
@@ -185,7 +185,7 @@ echo ""
 # ============================================================================
 # Configuration
 # ============================================================================
-QM9_DATA="/scratch/nishanth.r/new_egnn/egnn/data/qm9_optimized.jsonl"  # Your QM9 path
+QM9_DATA="/scratch/nishanth.r/egnn/data/qm9_100k.jsonl"  # Your QM9 path
 OUTPUT_DIR="outputs"
 CHECKPOINT_DIR="checkpoints"
 DATA_DIR="data"

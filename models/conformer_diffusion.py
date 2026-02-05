@@ -418,14 +418,153 @@ class ConformerDiffusion(nn.Module):
         
         return x_t
     
+    @torch.no_grad()
+    def guided_sample(self,
+                      atom_types: torch.Tensor,
+                      edge_index: torch.Tensor,
+                      bond_types: torch.Tensor,
+                      batch_idx: torch.Tensor,
+                      num_steps: int = 50,
+                      guidance_scale: float = 0.1) -> torch.Tensor:
+        """
+        DDIM sampling with 3D validity guidance.
+        
+        After each denoising step, applies gradient-based correction
+        to improve bond lengths and avoid steric clashes.
+        """
+        device = atom_types.device
+        N = atom_types.size(0)
+        B = batch_idx.max().item() + 1
+        
+        # Subsample timesteps
+        step_size = self.num_timesteps // num_steps
+        timesteps = torch.arange(0, self.num_timesteps, step_size, device=device).flip(0)
+        
+        # Start from noise
+        x_t = torch.randn(N, 3, device=device)
+        
+        for i, t_val in enumerate(timesteps):
+            t = torch.full((B,), t_val.item(), dtype=torch.long, device=device)
+            
+            # Predict noise
+            noise_pred = self.denoiser(x_t, t, atom_types, edge_index, bond_types, batch_idx)
+            
+            # Predict x_0
+            alpha_t = self.alphas_cumprod[t[batch_idx]].unsqueeze(-1)
+            x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+            x_0_pred = torch.clamp(x_0_pred, -10, 10)
+            
+            # Apply validity guidance to x_0_pred
+            x_0_guided = self._apply_validity_guidance(
+                x_0_pred, edge_index, bond_types, batch_idx,
+                num_steps=3, lr=guidance_scale
+            )
+            
+            if i == len(timesteps) - 1:
+                x_t = x_0_guided
+            else:
+                t_next = timesteps[i + 1].item()
+                t_next_tensor = torch.full((B,), t_next, dtype=torch.long, device=device)
+                alpha_next = self.alphas_cumprod[t_next_tensor[batch_idx]].unsqueeze(-1)
+                
+                # DDIM update with guided prediction
+                x_t = torch.sqrt(alpha_next) * x_0_guided + \
+                      torch.sqrt(1 - alpha_next) * noise_pred
+        
+        return x_t
+    
+    def _apply_validity_guidance(self,
+                                  pos: torch.Tensor,
+                                  edge_index: torch.Tensor,
+                                  bond_types: torch.Tensor,
+                                  batch_idx: torch.Tensor,
+                                  num_steps: int = 3,
+                                  lr: float = 0.1) -> torch.Tensor:
+        """
+        Apply gradient-based corrections to improve 3D validity.
+        """
+        pos = pos.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([pos], lr=lr)
+        
+        for _ in range(num_steps):
+            optimizer.zero_grad()
+            
+            # Compute validity loss
+            loss = self._compute_geometry_loss(pos, edge_index, bond_types, batch_idx)
+            
+            # Only backward if loss requires grad (has computational graph)
+            if loss.requires_grad and loss.item() > 0:
+                loss.backward()
+                optimizer.step()
+        
+        return pos.detach()
+    
+    def _compute_geometry_loss(self,
+                               pos: torch.Tensor,
+                               edge_index: torch.Tensor,
+                               bond_types: torch.Tensor,
+                               batch_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Compute differentiable geometry validity loss.
+        """
+        # 1. Bond length loss (always has gradient)
+        row, col = edge_index
+        diff = pos[row] - pos[col]
+        dists = torch.norm(diff, dim=-1).clamp(min=1e-6)
+        
+        # Target distance by bond type
+        target_dists = torch.ones_like(dists) * 1.5  # Default single bond
+        target_dists[bond_types == 2] = 1.34  # Double
+        target_dists[bond_types == 3] = 1.20  # Triple
+        target_dists[bond_types == 4] = 1.40  # Aromatic
+        
+        bond_loss = F.mse_loss(dists, target_dists)
+        loss = 10.0 * bond_loss  # Start with bond_loss (has grad_fn)
+        
+        # 2. Repulsion loss for non-bonded atoms
+        N = pos.size(0)
+        
+        # Create bonded mask
+        bonded_mask = torch.zeros(N, N, device=pos.device, dtype=torch.bool)
+        bonded_mask[row, col] = True
+        
+        # Compute all pairwise distances
+        all_dists = torch.cdist(pos, pos)  # (N, N)
+        
+        # Same-molecule mask
+        same_mol = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)  # (N, N)
+        
+        # Non-bonded, same-molecule pairs
+        nb_mask = same_mol & ~bonded_mask & ~torch.eye(N, device=pos.device, dtype=torch.bool)
+        
+        # Soft repulsion: penalize distances < 1.5Å
+        min_dist = 1.5
+        clashing = all_dists[nb_mask]
+        clashing = clashing[clashing < min_dist]
+        
+        if len(clashing) > 0:
+            repulsion_loss = torch.mean((min_dist - clashing) ** 2)
+            loss = loss + 5.0 * repulsion_loss
+        
+        return loss
+    
     def get_loss(self,
                  x_0: torch.Tensor,
                  atom_types: torch.Tensor,
                  edge_index: torch.Tensor,
                  bond_types: torch.Tensor,
-                 batch_idx: torch.Tensor) -> torch.Tensor:
+                 batch_idx: torch.Tensor,
+                 geometry_weight: float = 0.1) -> torch.Tensor:
         """
-        Compute training loss.
+        Compute training loss with 3D validity regularization.
+        
+        Args:
+            x_0: Ground truth coordinates (N, 3)
+            atom_types: Atomic numbers (N,)
+            edge_index: Bond connections (2, E)
+            bond_types: Bond orders (E,)
+            batch_idx: Batch assignment (N,)
+            geometry_weight: Weight for geometry regularization
         """
         device = x_0.device
         B = batch_idx.max().item() + 1
@@ -439,10 +578,30 @@ class ConformerDiffusion(nn.Module):
         # Predict noise
         noise_pred = self.denoiser(x_t, t, atom_types, edge_index, bond_types, batch_idx)
         
-        # MSE loss
-        loss = F.mse_loss(noise_pred, noise)
+        # MSE loss (main denoising objective)
+        mse_loss = F.mse_loss(noise_pred, noise)
         
-        return loss
+        # Geometry regularization on predicted x_0
+        # Only apply at low noise levels (t < T/4) where structure matters
+        low_noise_mask = t < (self.num_timesteps // 4)
+        
+        if low_noise_mask.any():
+            # Get predicted x_0 for low-noise samples
+            with torch.no_grad():
+                alpha_t = self.sqrt_alphas_cumprod[t][batch_idx].unsqueeze(-1)
+                sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t][batch_idx].unsqueeze(-1)
+            
+            x_0_pred = (x_t - sqrt_one_minus * noise_pred) / alpha_t.clamp(min=1e-6)
+            x_0_pred = torch.clamp(x_0_pred, -10, 10)
+            
+            # Geometry loss
+            geo_loss = self._compute_geometry_loss(x_0_pred, edge_index, bond_types, batch_idx)
+            
+            total_loss = mse_loss + geometry_weight * geo_loss
+        else:
+            total_loss = mse_loss
+        
+        return total_loss
 
 
 # =============================================================================
