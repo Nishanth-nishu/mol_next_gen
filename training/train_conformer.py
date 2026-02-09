@@ -136,8 +136,8 @@ def collate_fn(batch):
 # TRAINING
 # =============================================================================
 
-def train_epoch(model, dataloader, optimizer, device, epoch):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, optimizer, device, epoch, max_epochs=100):
+    """Train for one epoch with curriculum-based geometry learning."""
     model.train()
     total_loss = 0
     num_batches = 0
@@ -154,9 +154,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         # Center coordinates (important for equivariance)
         coords = coords - scatter_mean(coords, batch_idx, dim=0)[batch_idx]
         
-        # Forward
+        # Forward with curriculum geometry learning
         optimizer.zero_grad()
-        loss = model.get_loss(coords, atom_types, edge_index, bond_types, batch_idx)
+        loss = model.get_loss(
+            coords, atom_types, edge_index, bond_types, batch_idx,
+            geometry_weight=0.3,
+            epoch=epoch,
+            max_epochs=max_epochs
+        )
         
         # Backward
         loss.backward()
@@ -269,7 +274,7 @@ def sample_and_evaluate(model, dataloader, device, num_samples=10, use_guidance=
         if use_guidance and hasattr(model, 'guided_sample'):
             coords_gen = model.guided_sample(
                 atom_types, edge_index, bond_types, batch_idx, 
-                num_steps=50, guidance_scale=0.1
+                num_steps=50, guidance_scale=1.0  # Higher guidance for better geometry
             )
         else:
             coords_gen = model.ddim_sample(
@@ -301,24 +306,27 @@ def sample_and_evaluate(model, dataloader, device, num_samples=10, use_guidance=
 @torch.no_grad()
 def evaluate_3d_validity(model, dataloader, device, num_samples=20):
     """
-    Evaluate 3D validity of generated conformers.
+    Evaluate STRICT 3D validity of generated conformers.
+    
+    Uses chemistry-aware bond length targets (no fallbacks).
     
     Returns:
         bond_valid_rate: Fraction of molecules with valid bond lengths
         clash_free_rate: Fraction of molecules without steric clashes
+        fully_valid_rate: Fraction of molecules passing ALL validity checks
         mean_bond_error: Mean deviation from ideal bond lengths
     """
+    from models.geometry_constraints import get_ideal_bond_length
+    
     model.eval()
     
     bond_errors = []
-    clash_counts = []
     valid_count = 0
     clash_free_count = 0
+    fully_valid_count = 0
     total = 0
     
-    # Expected bond lengths by type
-    IDEAL_BONDS = {1: 1.50, 2: 1.34, 3: 1.20, 4: 1.40}
-    BOND_TOL = 0.3  # Tolerance in Angstroms
+    BOND_TOL = 0.2  # Strict: 0.2Å tolerance
     MIN_NONBOND = 1.4  # Minimum non-bonded distance
     
     for batch in dataloader:
@@ -330,11 +338,11 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
         bond_types = batch['bond_types'].to(device)
         batch_idx = batch['batch_idx'].to(device)
         
-        # Generate using guided sampling
+        # Generate using guided sampling with higher guidance
         if hasattr(model, 'guided_sample'):
             coords_gen = model.guided_sample(
                 atom_types, edge_index, bond_types, batch_idx,
-                num_steps=50, guidance_scale=0.1
+                num_steps=50, guidance_scale=1.0  # Full guidance
             )
         else:
             coords_gen = model.ddim_sample(
@@ -348,6 +356,7 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
             
             mask = (batch_idx == b)
             coords = coords_gen[mask]
+            mol_atom_types = atom_types[mask]
             N = mask.sum().item()
             
             # Get edges for this molecule
@@ -359,7 +368,7 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
             idx_map = torch.cumsum(mask.long(), 0) - 1
             local_edges = idx_map[mol_edges]
             
-            # Check bond lengths
+            # Check bond lengths with chemistry-aware targets
             mol_valid = True
             mol_bond_error = 0.0
             n_bonds = 0
@@ -368,8 +377,12 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
                 i, j = local_edges[0, e_idx].item(), local_edges[1, e_idx].item()
                 btype = mol_bond_types[e_idx].item()
                 
+                # Use chemistry-aware ideal distance
+                a1 = mol_atom_types[i].item()
+                a2 = mol_atom_types[j].item()
+                ideal = get_ideal_bond_length(a1, a2, btype)
+                
                 dist = torch.norm(coords[i] - coords[j]).item()
-                ideal = IDEAL_BONDS.get(btype, 1.5)
                 error = abs(dist - ideal)
                 
                 mol_bond_error += error
@@ -396,22 +409,32 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
                         dist = torch.norm(coords[i] - coords[j]).item()
                         if dist < MIN_NONBOND:
                             has_clash = True
+                            break
+                if has_clash:
+                    break
             
             if not has_clash:
                 clash_free_count += 1
+            
+            # Fully valid: bonds OK AND no clashes
+            if mol_valid and not has_clash:
+                fully_valid_count += 1
             
             total += 1
     
     bond_valid_rate = valid_count / total if total > 0 else 0.0
     clash_free_rate = clash_free_count / total if total > 0 else 0.0
+    fully_valid_rate = fully_valid_count / total if total > 0 else 0.0
     mean_bond_error = np.mean(bond_errors) if bond_errors else 0.0
     
     return {
         'bond_valid_rate': bond_valid_rate,
         'clash_free_rate': clash_free_rate,
+        'fully_valid_rate': fully_valid_rate,
         'mean_bond_error': mean_bond_error,
         'total_evaluated': total
     }
+
 
 
 # =============================================================================
@@ -496,8 +519,8 @@ def main():
     history = []
     
     for epoch in range(1, args.epochs + 1):
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, device, epoch)
+        # Train with curriculum geometry learning
+        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, max_epochs=args.epochs)
         
         # Validate
         val_loss = validate(model, val_loader, device)
@@ -518,7 +541,7 @@ def main():
         if rmsd_mean > 0:
             log_msg += f", rmsd={rmsd_mean:.3f}±{rmsd_std:.3f}Å"
         if validity:
-            log_msg += f"\n  → 3D Validity: bonds={validity['bond_valid_rate']*100:.1f}%, no_clash={validity['clash_free_rate']*100:.1f}%, bond_err={validity['mean_bond_error']:.3f}Å"
+            log_msg += f"\n  → 3D Validity: fully_valid={validity['fully_valid_rate']*100:.1f}%, bonds={validity['bond_valid_rate']*100:.1f}%, no_clash={validity['clash_free_rate']*100:.1f}%, bond_err={validity['mean_bond_error']:.3f}Å"
         print(log_msg)
         
         history.append({

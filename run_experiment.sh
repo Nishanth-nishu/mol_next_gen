@@ -1,4 +1,23 @@
 #!/bin/bash
+#SBATCH -A plafnet2
+#SBATCH -p plafnet2
+#SBATCH -J JEPA_TRAIN
+#SBATCH -n 10
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=gnode118
+#SBATCH --mem-per-cpu=3G
+#SBATCH --time=4-00:00:00
+#SBATCH --output=jepa_train_%j.log
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=nishanth0962333@gmail.com
+
+echo "=========================================="
+echo "JEPA GEOMETRY MODEL TRAINING (FIXED)"
+echo "=========================================="
+echo "SLURM_JOB_ID    = $SLURM_JOB_ID"
+echo "SLURM_NODELIST  = $SLURM_NODELIST"
+echo "START TIME      = $(date)"
+echo "=========================================="
 # ============================================================================
 # run_experiment.sh — Full NExT-Mol Experiment Pipeline
 # ============================================================================
@@ -150,22 +169,28 @@ if $DO_TRAIN; then
 fi
 
 # ============================================================================
-# STAGE 3: Generate Molecules
+# STAGE 3: Generate Molecules (DIFFUSION ONLY - No RDKit Fallback!)
 # ============================================================================
 if $DO_GENERATE; then
     echo "============================================================================"
-    echo "STAGE 3: Generating Molecules (NExT-Mol Approach)"
+    echo "STAGE 3: Generating Molecules (Diffusion Only - No Fallbacks)"
     echo "============================================================================"
+    echo "Using trained diffusion model for 3D coordinates"
+    echo "Outputs: SDF, PDB files, and novelty analysis"
+    echo ""
     
     python generation/generate_nextmol.py \
         --num_molecules $NUM_MOLECULES \
         --selfies_data $DATA_DIR/qm9_selfies.jsonl \
         --conformer_model $CHECKPOINT_DIR/conformer_best.pt \
         --output $OUTPUT_DIR/generated_nextmol.sdf \
-        --ddim_steps $DDIM_STEPS
+        --ddim_steps $DDIM_STEPS \
+        --guidance_scale 1.0
     
     echo ""
     echo "Generation complete!"
+    echo "  SDF: $OUTPUT_DIR/generated_nextmol.sdf"
+    echo "  PDB: $OUTPUT_DIR/generated_nextmol_pdb/"
     echo ""
 fi
 
@@ -203,3 +228,8 @@ echo ""
 echo "Key insight: NExT-Mol achieves near-100% validity by pre-validating"
 echo "topology (SELFIES) before generating 3D coordinates!"
 echo ""
+
+echo "=========================================="
+echo "JOB COMPLETED"
+echo "END TIME = $(date)"
+echo "=========================================="

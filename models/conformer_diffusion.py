@@ -418,19 +418,26 @@ class ConformerDiffusion(nn.Module):
         
         return x_t
     
-    @torch.no_grad()
     def guided_sample(self,
                       atom_types: torch.Tensor,
                       edge_index: torch.Tensor,
                       bond_types: torch.Tensor,
                       batch_idx: torch.Tensor,
                       num_steps: int = 50,
-                      guidance_scale: float = 0.1) -> torch.Tensor:
+                      guidance_scale: float = 1.0) -> torch.Tensor:
         """
-        DDIM sampling with 3D validity guidance.
+        DDIM sampling with integrated geometry guidance.
         
-        After each denoising step, applies gradient-based correction
-        to improve bond lengths and avoid steric clashes.
+        Uses classifier-free guidance where the geometry gradient is used
+        to modify the predicted x_0 during denoising (not post-hoc).
+        
+        Args:
+            atom_types: (N,) atomic numbers
+            edge_index: (2, E) bond connections  
+            bond_types: (E,) bond orders
+            batch_idx: (N,) batch assignment
+            num_steps: Number of DDIM steps
+            guidance_scale: Strength of geometry guidance (higher = stricter)
         """
         device = atom_types.device
         N = atom_types.size(0)
@@ -446,21 +453,25 @@ class ConformerDiffusion(nn.Module):
         for i, t_val in enumerate(timesteps):
             t = torch.full((B,), t_val.item(), dtype=torch.long, device=device)
             
-            # Predict noise
-            noise_pred = self.denoiser(x_t, t, atom_types, edge_index, bond_types, batch_idx)
+            # Predict noise (no gradient needed for model)
+            with torch.no_grad():
+                noise_pred = self.denoiser(x_t, t, atom_types, edge_index, bond_types, batch_idx)
             
             # Predict x_0
             alpha_t = self.alphas_cumprod[t[batch_idx]].unsqueeze(-1)
             x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
             x_0_pred = torch.clamp(x_0_pred, -10, 10)
             
-            # Apply validity guidance to x_0_pred
-            x_0_guided = self._apply_validity_guidance(
-                x_0_pred, edge_index, bond_types, batch_idx,
-                num_steps=3, lr=guidance_scale
+            # Apply geometry guidance using gradient descent on x_0
+            # This is integrated guidance: we modify x_0_pred based on geometry
+            x_0_guided = self._geometry_gradient_step(
+                x_0_pred, atom_types, edge_index, bond_types, batch_idx,
+                num_iters=5,  # More iterations for better guidance
+                lr=guidance_scale * 0.05
             )
             
             if i == len(timesteps) - 1:
+                # Final step: return guided prediction
                 x_t = x_0_guided
             else:
                 t_next = timesteps[i + 1].item()
@@ -472,6 +483,71 @@ class ConformerDiffusion(nn.Module):
                       torch.sqrt(1 - alpha_next) * noise_pred
         
         return x_t
+    
+    def _geometry_gradient_step(self,
+                                 pos: torch.Tensor,
+                                 atom_types: torch.Tensor,
+                                 edge_index: torch.Tensor,
+                                 bond_types: torch.Tensor,
+                                 batch_idx: torch.Tensor,
+                                 num_iters: int = 5,
+                                 lr: float = 0.05) -> torch.Tensor:
+        """
+        Apply gradient-based corrections using chemistry-aware loss.
+        
+        This uses the same loss function as training for consistency.
+        """
+        from models.geometry_constraints import get_ideal_bond_length
+        
+        pos = pos.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([pos], lr=lr)
+        
+        row, col = edge_index
+        
+        for _ in range(num_iters):
+            optimizer.zero_grad()
+            
+            # Bond length loss with chemistry-aware targets
+            diff = pos[row] - pos[col]
+            dists = torch.norm(diff, dim=-1).clamp(min=1e-6)
+            
+            # Get ideal distances
+            ideal_dists = torch.zeros_like(dists)
+            for e in range(len(dists)):
+                a1 = atom_types[row[e]].item()
+                a2 = atom_types[col[e]].item()
+                bo = bond_types[e].item()
+                ideal_dists[e] = get_ideal_bond_length(a1, a2, bo)
+            
+            bond_loss = torch.mean((dists - ideal_dists) ** 2)
+            
+            # Repulsion loss
+            N = pos.size(0)
+            if N <= 100:  # Only for small molecules (efficiency)
+                bonded_mask = torch.zeros(N, N, device=pos.device, dtype=torch.bool)
+                bonded_mask[row, col] = True
+                
+                all_dists = torch.cdist(pos, pos)
+                same_mol = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)
+                nb_mask = same_mol & ~bonded_mask & ~torch.eye(N, device=pos.device, dtype=torch.bool)
+                
+                clashing = all_dists[nb_mask]
+                clashing = clashing[clashing < 1.5]
+                
+                if len(clashing) > 0:
+                    repulsion_loss = torch.mean((1.5 - clashing) ** 2)
+                    loss = 10.0 * bond_loss + 5.0 * repulsion_loss
+                else:
+                    loss = 10.0 * bond_loss
+            else:
+                loss = 10.0 * bond_loss
+            
+            # Gradient step
+            if loss.requires_grad:
+                loss.backward()
+                optimizer.step()
+        
+        return pos.detach()
     
     def _apply_validity_guidance(self,
                                   pos: torch.Tensor,
@@ -554,9 +630,11 @@ class ConformerDiffusion(nn.Module):
                  edge_index: torch.Tensor,
                  bond_types: torch.Tensor,
                  batch_idx: torch.Tensor,
-                 geometry_weight: float = 0.1) -> torch.Tensor:
+                 geometry_weight: float = 0.3,
+                 epoch: int = 1,
+                 max_epochs: int = 100) -> torch.Tensor:
         """
-        Compute training loss with 3D validity regularization.
+        Compute training loss with chemistry-aware 3D validity regularization.
         
         Args:
             x_0: Ground truth coordinates (N, 3)
@@ -564,7 +642,9 @@ class ConformerDiffusion(nn.Module):
             edge_index: Bond connections (2, E)
             bond_types: Bond orders (E,)
             batch_idx: Batch assignment (N,)
-            geometry_weight: Weight for geometry regularization
+            geometry_weight: Base weight for geometry regularization
+            epoch: Current training epoch (for curriculum)
+            max_epochs: Total training epochs
         """
         device = x_0.device
         B = batch_idx.max().item() + 1
@@ -581,27 +661,88 @@ class ConformerDiffusion(nn.Module):
         # MSE loss (main denoising objective)
         mse_loss = F.mse_loss(noise_pred, noise)
         
-        # Geometry regularization on predicted x_0
-        # Only apply at low noise levels (t < T/4) where structure matters
-        low_noise_mask = t < (self.num_timesteps // 4)
+        # Curriculum: increase geometry weight as training progresses
+        curriculum_factor = min(1.0, epoch / (max_epochs * 0.3))  # Ramp up over first 30% of training
+        effective_geo_weight = geometry_weight * curriculum_factor
         
-        if low_noise_mask.any():
-            # Get predicted x_0 for low-noise samples
-            with torch.no_grad():
-                alpha_t = self.sqrt_alphas_cumprod[t][batch_idx].unsqueeze(-1)
-                sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t][batch_idx].unsqueeze(-1)
-            
-            x_0_pred = (x_t - sqrt_one_minus * noise_pred) / alpha_t.clamp(min=1e-6)
-            x_0_pred = torch.clamp(x_0_pred, -10, 10)
-            
-            # Geometry loss
-            geo_loss = self._compute_geometry_loss(x_0_pred, edge_index, bond_types, batch_idx)
-            
-            total_loss = mse_loss + geometry_weight * geo_loss
-        else:
-            total_loss = mse_loss
+        # Timestep-dependent weighting: stronger at low noise (low t)
+        t_per_atom = t[batch_idx]  # (N,)
+        noise_level = t_per_atom.float() / self.num_timesteps  # 0 = no noise, 1 = full noise
+        timestep_weight = (1.0 - noise_level).mean()  # Stronger at low noise
+        
+        # Predict x_0 from noisy x_t
+        alpha_t = self.sqrt_alphas_cumprod[t][batch_idx].unsqueeze(-1)
+        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t][batch_idx].unsqueeze(-1)
+        
+        x_0_pred = (x_t - sqrt_one_minus * noise_pred) / alpha_t.clamp(min=1e-6)
+        x_0_pred = torch.clamp(x_0_pred, -10, 10)
+        
+        # Chemistry-aware geometry loss
+        geo_loss = self._compute_chemistry_aware_loss(
+            x_0_pred, atom_types, edge_index, bond_types, batch_idx
+        )
+        
+        total_loss = mse_loss + effective_geo_weight * timestep_weight * geo_loss
         
         return total_loss
+    
+    def _compute_chemistry_aware_loss(self,
+                                       pos: torch.Tensor,
+                                       atom_types: torch.Tensor,
+                                       edge_index: torch.Tensor,
+                                       bond_types: torch.Tensor,
+                                       batch_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Compute chemistry-aware geometry loss with atom-pair-specific targets.
+        """
+        # Import here to avoid circular imports
+        from models.geometry_constraints import get_ideal_bond_length
+        
+        row, col = edge_index
+        
+        # 1. Bond length loss with chemistry-aware targets
+        diff = pos[row] - pos[col]
+        dists = torch.norm(diff, dim=-1).clamp(min=1e-6)
+        
+        # Get ideal distance for each bond based on atom types
+        ideal_dists = torch.zeros_like(dists)
+        for e in range(len(dists)):
+            a1 = atom_types[row[e]].item()
+            a2 = atom_types[col[e]].item()
+            bo = bond_types[e].item()
+            ideal_dists[e] = get_ideal_bond_length(a1, a2, bo)
+        
+        bond_loss = F.mse_loss(dists, ideal_dists)
+        
+        # 2. Repulsion loss for non-bonded atoms
+        N = pos.size(0)
+        
+        # Only compute for small batches (expensive otherwise)
+        if N > 200:
+            # Use sampling for large batches
+            loss = 10.0 * bond_loss
+        else:
+            bonded_mask = torch.zeros(N, N, device=pos.device, dtype=torch.bool)
+            bonded_mask[row, col] = True
+            
+            all_dists = torch.cdist(pos, pos)
+            same_mol = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)
+            nb_mask = same_mol & ~bonded_mask & ~torch.eye(N, device=pos.device, dtype=torch.bool)
+            
+            min_dist = 1.5
+            clashing = all_dists[nb_mask]
+            clashing = clashing[clashing < min_dist]
+            
+            if len(clashing) > 0:
+                repulsion_loss = torch.mean((min_dist - clashing) ** 2)
+                loss = 10.0 * bond_loss + 5.0 * repulsion_loss
+            else:
+                loss = 10.0 * bond_loss
+        
+        return loss
+
+
+
 
 
 # =============================================================================

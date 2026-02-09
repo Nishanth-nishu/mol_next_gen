@@ -142,58 +142,27 @@ class NExTMolGenerator:
         # ==============================
         # STAGE 2: Generate 3D Conformer
         # ==============================
-        if use_diffusion and self.conformer_model is not None:
-            # Use our trained diffusion model
-            atom_types = graph['atom_types'].to(self.device)
-            edge_index = graph['edge_index'].to(self.device)
-            bond_types = graph['bond_types'].to(self.device)
-            batch_idx = torch.zeros(len(atom_types), dtype=torch.long, device=self.device)
-            
-            # Sample coordinates
-            coords = self.conformer_model.ddim_sample(
-                atom_types, edge_index, bond_types, batch_idx,
-                num_steps=ddim_steps
-            )
-            
-            # Optional: Refine with validity filter
-            if refine_geometry:
-                coords = self.validity_filter.project_to_valid(
-                    coords, edge_index, bond_types, num_steps=20
-                )
-            
-            coords = coords.cpu().numpy()
-            result['method'] = 'diffusion'
-            
-        else:
-            # Fallback: Use RDKit ETKDG
-            mol = AllChem.AddHs(mol)  # Add hydrogens
-            success = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-            
-            if success == -1:
-                # Failed to embed, try with random coords
-                AllChem.EmbedMolecule(mol, randomSeed=42)
-            
-            # Optimize geometry
-            try:
-                AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
-            except:
-                pass
-            
-            mol = AllChem.RemoveHs(mol)  # Remove hydrogens
-            
-            # Get coordinates
-            if mol.GetNumConformers() > 0:
-                conf = mol.GetConformer()
-                coords = np.array([
-                    [conf.GetAtomPosition(i).x, 
-                     conf.GetAtomPosition(i).y, 
-                     conf.GetAtomPosition(i).z]
-                    for i in range(mol.GetNumAtoms())
-                ])
-            else:
-                return result
-            
-            result['method'] = 'rdkit'
+        if self.conformer_model is None:
+            result['error'] = 'No conformer model loaded - cannot generate without fallback'
+            result['method'] = 'none'
+            return result
+        
+        # Use trained diffusion model with integrated geometry guidance
+        atom_types = graph['atom_types'].to(self.device)
+        edge_index = graph['edge_index'].to(self.device)
+        bond_types = graph['bond_types'].to(self.device)
+        batch_idx = torch.zeros(len(atom_types), dtype=torch.long, device=self.device)
+        
+        # Sample coordinates using guided sampling (no post-hoc refinement)
+        # The guided_sample integrates geometry constraints during denoising
+        coords = self.conformer_model.guided_sample(
+            atom_types, edge_index, bond_types, batch_idx,
+            num_steps=ddim_steps,
+            guidance_scale=1.0  # Full geometry guidance
+        )
+        
+        coords = coords.cpu().numpy()
+        result['method'] = 'diffusion_guided'
         
         # Add coordinates to mol
         result['coordinates'] = coords.tolist()
@@ -237,6 +206,11 @@ class NExTMolGenerator:
         results = []
         valid_count = 0
         
+        # Enforce diffusion-only mode
+        if use_diffusion and self.conformer_model is None:
+            raise RuntimeError("Diffusion model not loaded! Cannot generate without RDKit fallback. "
+                             "Please provide a trained conformer model.")
+        
         iterator = range(num_molecules)
         if progress:
             iterator = tqdm(iterator, desc="Generating")
@@ -263,7 +237,7 @@ class NExTMolGenerator:
         return results
     
     def _save_results(self, results: list, save_path: str):
-        """Save generated molecules to SDF and JSON."""
+        """Save generated molecules to SDF, PDB, and JSON."""
         base_path = save_path.rsplit('.', 1)[0]
         
         # Save SDF
@@ -279,6 +253,26 @@ class NExTMolGenerator:
         writer.close()
         print(f"Saved {len(valid_mols)} molecules to {sdf_path}")
         
+        # Convert SDF to PDB
+        pdb_dir = base_path + '_pdb'
+        os.makedirs(pdb_dir, exist_ok=True)
+        
+        pdb_count = 0
+        for i, r in enumerate(valid_mols):
+            mol = r['mol']
+            if mol is not None:
+                pdb_path = os.path.join(pdb_dir, f'mol_{i:04d}.pdb')
+                try:
+                    Chem.MolToPDBFile(mol, pdb_path)
+                    pdb_count += 1
+                except Exception as e:
+                    print(f"Warning: Could not save mol {i} to PDB: {e}")
+        
+        print(f"Saved {pdb_count} PDB files to {pdb_dir}/")
+        
+        # Compute novelty
+        novelty_info = self._compute_novelty(valid_mols)
+        
         # Save JSON summary
         json_path = base_path + '_summary.json'
         summary = {
@@ -286,6 +280,7 @@ class NExTMolGenerator:
             'valid': sum(1 for r in results if r['valid']),
             'validity_rate': sum(1 for r in results if r['valid']) / len(results),
             'method_counts': {},
+            'novelty': novelty_info,
             'smiles': [r['smiles'] for r in results if r['smiles']]
         }
         
@@ -297,6 +292,57 @@ class NExTMolGenerator:
             json.dump(summary, f, indent=2)
         
         print(f"Saved summary to {json_path}")
+        
+        # Print novelty stats
+        print(f"\n=== Novelty Analysis ===")
+        print(f"  Unique molecules: {novelty_info['unique_count']} / {len(valid_mols)} ({novelty_info['unique_rate']*100:.1f}%)")
+        print(f"  Novel (not in training): {novelty_info['novel_count']} / {len(valid_mols)} ({novelty_info['novelty_rate']*100:.1f}%)")
+    
+    def _compute_novelty(self, valid_mols: list) -> dict:
+        """
+        Compute novelty metrics.
+        
+        - Uniqueness: fraction of unique SMILES among generated
+        - Novelty: fraction not in training set
+        """
+        # Get training SMILES for comparison
+        training_smiles = set()
+        if hasattr(self.selfies_gen, 'selfies_pool'):
+            for selfies_str in self.selfies_gen.selfies_pool:
+                try:
+                    mol = selfies_to_mol(selfies_str)
+                    if mol:
+                        training_smiles.add(Chem.MolToSmiles(mol, canonical=True))
+                except:
+                    pass
+        
+        # Generated SMILES
+        generated_smiles = []
+        for r in valid_mols:
+            if r['smiles']:
+                try:
+                    canonical = Chem.MolToSmiles(Chem.MolFromSmiles(r['smiles']), canonical=True)
+                    generated_smiles.append(canonical)
+                except:
+                    generated_smiles.append(r['smiles'])
+        
+        # Uniqueness
+        unique_smiles = set(generated_smiles)
+        unique_count = len(unique_smiles)
+        unique_rate = unique_count / len(generated_smiles) if generated_smiles else 0.0
+        
+        # Novelty (not in training)
+        novel_smiles = unique_smiles - training_smiles
+        novel_count = len(novel_smiles)
+        novelty_rate = novel_count / len(unique_smiles) if unique_smiles else 0.0
+        
+        return {
+            'unique_count': unique_count,
+            'unique_rate': unique_rate,
+            'novel_count': novel_count,
+            'novelty_rate': novelty_rate,
+            'training_set_size': len(training_smiles)
+        }
 
 
 # =============================================================================
@@ -304,32 +350,46 @@ class NExTMolGenerator:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate molecules with NExT-Mol approach')
+    parser = argparse.ArgumentParser(description='Generate molecules with NExT-Mol approach (DIFFUSION ONLY)')
     parser.add_argument('--num_molecules', type=int, default=100,
                         help='Number of molecules to generate')
     parser.add_argument('--selfies_data', type=str, default='data/qm9_selfies.jsonl',
                         help='Path to SELFIES data for topology sampling')
     parser.add_argument('--conformer_model', type=str, default='checkpoints/conformer_best.pt',
-                        help='Path to trained conformer model')
+                        help='Path to trained conformer model (REQUIRED)')
     parser.add_argument('--output', type=str, default='generated_nextmol.sdf',
                         help='Output file path')
-    parser.add_argument('--use_rdkit', action='store_true',
-                        help='Use RDKit instead of diffusion for 3D coordinates')
     parser.add_argument('--ddim_steps', type=int, default=50,
                         help='Number of DDIM steps for generation')
+    parser.add_argument('--guidance_scale', type=float, default=1.0,
+                        help='Geometry guidance strength')
     
     args = parser.parse_args()
     
-    # Create generator
+    # Strict: ALWAYS require the conformer model
+    if not os.path.exists(args.conformer_model):
+        print(f"ERROR: Conformer model not found at {args.conformer_model}")
+        print("Cannot generate molecules without the trained diffusion model!")
+        print("Please train first with: bash run_experiment.sh --train")
+        sys.exit(1)
+    
+    # Create generator with REQUIRED conformer model
     generator = NExTMolGenerator(
         selfies_data_path=args.selfies_data,
-        conformer_model_path=args.conformer_model if not args.use_rdkit else None
+        conformer_model_path=args.conformer_model
     )
     
-    # Generate
+    if generator.conformer_model is None:
+        print("ERROR: Failed to load conformer model. Cannot proceed without RDKit fallback.")
+        sys.exit(1)
+    
+    print("\n=== DIFFUSION-ONLY MODE ===")
+    print("Using trained diffusion model for 3D coordinates (no RDKit fallback)")
+    
+    # Generate (always use diffusion)
     results = generator.generate(
         num_molecules=args.num_molecules,
-        use_diffusion=not args.use_rdkit,
+        use_diffusion=True,  # ALWAYS True
         save_path=args.output
     )
     
@@ -342,3 +402,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
