@@ -141,3 +141,16 @@ visualizations/
 !setup.cfg
 !pyproject.toml
 !.gitignore
+
+# =============================================================================
+# Experiment Folders — track scripts & config, ignore heavy outputs
+# =============================================================================
+# Allow experiment config.json and visualization scripts
+!experiments/**/config.json
+!experiments/**/visualization/*.py
+
+# Ignore heavy experiment outputs (checkpoints, plots, logs, eval data)
+experiments/**/checkpoints/
+experiments/**/plots/
+experiments/**/logs/
+experiments/**/evaluation/

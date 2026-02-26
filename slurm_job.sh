@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=4-00:00:00
 #SBATCH --nodelist=gnode118
 
 # ============================================================================
@@ -25,12 +25,9 @@ echo "Node: $SLURM_NODELIST"
 echo "Date: $(date)"
 echo ""
 
-# Activate conda environment
-INSTALL_DIR="/scratch/nishanth.r/miniconda3"
-ENV_NAME="nextmol"
 
-source "$INSTALL_DIR/etc/profile.d/conda.sh"
-conda activate $ENV_NAME
+cd /scratch/nishanth.r/mol_next_gen
+source venv/bin/activate
 
 echo "Python: $(which python)"
 python -c 'import torch; print(f"PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}")'
@@ -38,11 +35,14 @@ nvidia-smi
 echo ""
 
 # Change to experiment directory
-cd /scratch/nishanth.r/nextmol_experiment
 
 # Run the experiment
-bash run_experiment.sh
-
+# Kill current run, then:
+python training/train_conformer.py \
+    --geometry_weight 0.1 \
+    --epochs 200 \
+    --data data/qm9_selfies.jsonl \
+    2>&1 | tee training_$(date +%Y%m%d_%H%M).log
 echo ""
 echo "Job completed at: $(date)"
 

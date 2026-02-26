@@ -136,80 +136,96 @@ def collate_fn(batch):
 # TRAINING
 # =============================================================================
 
-def train_epoch(model, dataloader, optimizer, device, epoch, max_epochs=100):
-    """Train for one epoch with curriculum-based geometry learning."""
+def train_epoch(model, dataloader, optimizer, device, epoch, max_epochs=100,
+                geometry_weight=1.0):
+    """
+    Train one epoch with curriculum geometry learning.
+    Returns dict with mean total/mse/geo losses.
+    """
+    from models.conformer_diffusion import remove_com
     model.train()
-    total_loss = 0
+    total_loss = mse_loss_sum = geo_loss_sum = 0.0
     num_batches = 0
-    
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch in pbar:
-        # Move to device
         atom_types = batch['atom_types'].to(device)
-        coords = batch['coordinates'].to(device)
+        coords     = batch['coordinates'].to(device)
         edge_index = batch['edge_index'].to(device)
         bond_types = batch['bond_types'].to(device)
-        batch_idx = batch['batch_idx'].to(device)
-        
-        # Center coordinates (important for equivariance)
-        coords = coords - scatter_mean(coords, batch_idx, dim=0)[batch_idx]
-        
-        # Forward with curriculum geometry learning
+        batch_idx  = batch['batch_idx'].to(device)
+
+        coords = remove_com(coords, batch_idx)
+
         optimizer.zero_grad()
-        loss = model.get_loss(
+        loss_dict = model.get_loss(
             coords, atom_types, edge_index, bond_types, batch_idx,
-            geometry_weight=0.3,
+            geometry_weight=geometry_weight,
             epoch=epoch,
-            max_epochs=max_epochs
+            max_epochs=max_epochs,
+            min_snr_gamma=5.0,
         )
-        
-        # Backward
-        loss.backward()
+
+        loss_dict['total'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-        
-        pbar.set_postfix({'loss': loss.item()})
-    
-    return total_loss / num_batches
+
+        t = loss_dict['total'].item()
+        total_loss    += t
+        mse_loss_sum  += loss_dict['mse'].item()
+        geo_loss_sum  += loss_dict['geo'].item()
+        num_batches   += 1
+        pbar.set_postfix({'loss': f'{t:.4f}',
+                          'mse': f'{loss_dict["mse"].item():.4f}'})
+
+    n = max(num_batches, 1)
+    return {'total': total_loss/n, 'mse': mse_loss_sum/n, 'geo': geo_loss_sum/n}
 
 
 def scatter_mean(src, index, dim=0):
-    """Compute mean by scattering."""
+    """Compute mean by scattering (kept for backward compat)."""
     count = torch.zeros(index.max() + 1, device=src.device)
     count.scatter_add_(0, index, torch.ones_like(index, dtype=torch.float))
     count = count.clamp(min=1)
-    
     out = torch.zeros(index.max() + 1, src.size(1), device=src.device)
     out.scatter_add_(0, index.unsqueeze(-1).expand(-1, src.size(1)), src)
-    
     return out / count.unsqueeze(-1)
 
 
 @torch.no_grad()
-def validate(model, dataloader, device):
-    """Validate model."""
+def validate(model, dataloader, device, geometry_weight=1.0, epoch=1, max_epochs=100):
+    """
+    Validate with SAME curriculum as training.
+    FIX: pass epoch so geometry curriculum is identical between train and val.
+    """
+    from models.conformer_diffusion import remove_com
     model.eval()
-    total_loss = 0
+    total_loss = mse_sum = geo_sum = 0.0
     num_batches = 0
-    
+
     for batch in dataloader:
         atom_types = batch['atom_types'].to(device)
-        coords = batch['coordinates'].to(device)
+        coords     = batch['coordinates'].to(device)
         edge_index = batch['edge_index'].to(device)
         bond_types = batch['bond_types'].to(device)
-        batch_idx = batch['batch_idx'].to(device)
-        
-        coords = coords - scatter_mean(coords, batch_idx, dim=0)[batch_idx]
-        
-        loss = model.get_loss(coords, atom_types, edge_index, bond_types, batch_idx)
-        
-        total_loss += loss.item()
+        batch_idx  = batch['batch_idx'].to(device)
+
+        coords = remove_com(coords, batch_idx)
+
+        loss_dict = model.get_loss(
+            coords, atom_types, edge_index, bond_types, batch_idx,
+            geometry_weight=geometry_weight,
+            epoch=epoch,
+            max_epochs=max_epochs,
+            min_snr_gamma=5.0,
+        )
+        total_loss += loss_dict['total'].item()
+        mse_sum    += loss_dict['mse'].item()
+        geo_sum    += loss_dict['geo'].item()
         num_batches += 1
-    
-    return total_loss / num_batches
+
+    n = max(num_batches, 1)
+    return {'total': total_loss/n, 'mse': mse_sum/n, 'geo': geo_sum/n}
 
 
 @torch.no_grad()
@@ -443,26 +459,20 @@ def evaluate_3d_validity(model, dataloader, device, num_samples=20):
 
 def main():
     parser = argparse.ArgumentParser(description='Train Conformer Diffusion')
-    parser.add_argument('--data', type=str, default='data/qm9_selfies.jsonl',
-                        help='Path to training data')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--hidden_dim', type=int, default=256,
-                        help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=6,
-                        help='Number of equivariant layers')
-    parser.add_argument('--timesteps', type=int, default=1000,
-                        help='Number of diffusion timesteps')
-    parser.add_argument('--max_atoms', type=int, default=15,
-                        help='Maximum atoms per molecule')
-    parser.add_argument('--save_dir', type=str, default='checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--val_split', type=float, default=0.1,
-                        help='Validation split ratio')
+    parser.add_argument('--data', type=str, default='data/qm9_selfies.jsonl')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--num_layers', type=int, default=6)
+    parser.add_argument('--timesteps', type=int, default=1000)
+    parser.add_argument('--max_atoms', type=int, default=15)
+    parser.add_argument('--edge_dim', type=int, default=32)
+    parser.add_argument('--time_dim', type=int, default=128)
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--val_split', type=float, default=0.1)
+    parser.add_argument('--geometry_weight', type=float, default=1.0,
+                        help='Geometry loss weight (1.0 recommended with SNR weighting)')
     
     args = parser.parse_args()
     
@@ -505,7 +515,9 @@ def main():
     model = ConformerDiffusion(
         num_timesteps=args.timesteps,
         hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers
+        num_layers=args.num_layers,
+        edge_dim=args.edge_dim,
+        time_dim=args.time_dim,
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -519,38 +531,57 @@ def main():
     history = []
     
     for epoch in range(1, args.epochs + 1):
-        # Train with curriculum geometry learning
-        train_loss = train_epoch(model, train_loader, optimizer, device, epoch, max_epochs=args.epochs)
-        
-        # Validate
-        val_loss = validate(model, val_loader, device)
-        
-        # Sample and compute RMSD (every 5 epochs for meaningful updates)
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, device, epoch,
+            max_epochs=args.epochs, geometry_weight=args.geometry_weight
+        )
+        train_loss = train_metrics['total']
+        train_mse  = train_metrics['mse']
+        train_geo  = train_metrics['geo']
+
+        # FIX: pass epoch so val curriculum = train curriculum (no artificial divergence)
+        val_metrics = validate(
+            model, val_loader, device,
+            geometry_weight=args.geometry_weight,
+            epoch=epoch, max_epochs=args.epochs
+        )
+        val_loss = val_metrics['total']
+        val_mse  = val_metrics['mse']
+
         rmsd_mean, rmsd_std = 0.0, 0.0
         validity = None
-        
+
         if epoch % 5 == 0 or epoch == 1:
-            rmsd_mean, rmsd_std = sample_and_evaluate(model, val_loader, device, num_samples=20)
-        
-        # Evaluate 3D validity (every 10 epochs)
+            rmsd_mean, rmsd_std = sample_and_evaluate(
+                model, val_loader, device, num_samples=50)
+
         if epoch % 10 == 0:
-            validity = evaluate_3d_validity(model, val_loader, device, num_samples=30)
-        
-        # Log
-        log_msg = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
+            validity = evaluate_3d_validity(model, val_loader, device, num_samples=50)
+
+        # Log — show both total and MSE so we can see the curriculum effect separately
+        log_msg = (f"Epoch {epoch}: "
+                   f"train={train_loss:.4f} (mse={train_mse:.4f} geo={train_geo:.4f}), "
+                   f"val={val_loss:.4f} (mse={val_mse:.4f})")
         if rmsd_mean > 0:
             log_msg += f", rmsd={rmsd_mean:.3f}±{rmsd_std:.3f}Å"
         if validity:
-            log_msg += f"\n  → 3D Validity: fully_valid={validity['fully_valid_rate']*100:.1f}%, bonds={validity['bond_valid_rate']*100:.1f}%, no_clash={validity['clash_free_rate']*100:.1f}%, bond_err={validity['mean_bond_error']:.3f}Å"
+            log_msg += (f"\n  → 3D Validity: "
+                        f"fully_valid={validity['fully_valid_rate']*100:.1f}%, "
+                        f"bonds={validity['bond_valid_rate']*100:.1f}%, "
+                        f"no_clash={validity['clash_free_rate']*100:.1f}%, "
+                        f"bond_err={validity['mean_bond_error']:.3f}Å")
         print(log_msg)
         
         history.append({
-            'epoch': epoch,
+            'epoch':      epoch,
             'train_loss': train_loss,
-            'val_loss': val_loss,
-            'rmsd_mean': rmsd_mean,
-            'rmsd_std': rmsd_std,
-            'lr': scheduler.get_last_lr()[0]
+            'train_mse':  train_mse,
+            'train_geo':  train_geo,
+            'val_loss':   val_loss,
+            'val_mse':    val_mse,
+            'rmsd_mean':  rmsd_mean,
+            'rmsd_std':   rmsd_std,
+            'lr':         scheduler.get_last_lr()[0],
         })
         
         # Save best

@@ -49,8 +49,23 @@ INSTALL_DIR="/scratch/nishanth.r/miniconda3"
 ENV_NAME="nextmol"
 
 # Activate conda
-source "$INSTALL_DIR/etc/profile.d/conda.sh"
-conda activate $ENV_NAME
+CONDA_SH="$INSTALL_DIR/etc/profile.d/conda.sh"
+
+if [ -f "$CONDA_SH" ]; then
+    source "$CONDA_SH"
+    conda activate $ENV_NAME
+else
+    echo "Warning: Conda script not found at $CONDA_SH"
+    
+    # Check if conda is reachable
+    if command -v conda &> /dev/null; then
+        echo "Using 'conda' from PATH..."
+        # Try to activate, but don't exit on failure (might rely on shell hook)
+        conda activate $ENV_NAME || echo "Warning: 'conda activate' returned error. Assuming environment is already set."
+    else
+        echo "Warning: 'conda' command not found. Assuming environment is already active."
+    fi
+fi
 
 echo "Python: $(which python)"
 echo "CUDA visible: $CUDA_VISIBLE_DEVICES"
@@ -68,14 +83,14 @@ DATA_DIR="data"
 
 # Training hyperparameters
 EPOCHS=100
-BATCH_SIZE=64
-HIDDEN_DIM=256
-NUM_LAYERS=6
+BATCH_SIZE=32
+HIDDEN_DIM=512
+NUM_LAYERS=12
 MAX_ATOMS=15
 
 # Generation parameters
 NUM_MOLECULES=1000
-DDIM_STEPS=50
+DDIM_STEPS=500
 
 # Create directories
 mkdir -p $OUTPUT_DIR $CHECKPOINT_DIR $DATA_DIR

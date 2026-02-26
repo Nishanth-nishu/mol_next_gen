@@ -1,0 +1,22 @@
+{
+  "args": {
+    "data": "data/qm9_selfies.jsonl",
+    "max_atoms": 15,
+    "val_split": 0.1,
+    "epochs": 100,
+    "batch_size": 64,
+    "lr": 0.0001,
+    "hidden_dim": 256,
+    "num_layers": 6,
+    "timesteps": 1000,
+    "edge_dim": 32,
+    "time_dim": 128,
+    "geometry_weight": 1.0,
+    "planarity_weight": 5.0,
+    "chirality_weight": 3.0,
+    "ring_strain_weight": 2.0,
+    "exp_dir": "experiments/23-02-2026-Exp-1(soft_restrictions)"
+  },
+  "experiment": "23-02-2026-Exp-1(soft_restrictions)",
+  "date": "2026-02-26T12:41:38.966975"
+}
