@@ -1,156 +1,70 @@
-# =============================================================================
 # Python
-# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
+*.pyo
+*.pyd
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
 *.egg
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# =============================================================================
-# Virtual Environments
-# =============================================================================
+# Virtual environments
 venv/
-ENV/
 env/
 .venv/
-conda_envs/
-miniconda3/
+.env/
 
-# =============================================================================
-# Jupyter Notebooks
-# =============================================================================
+# Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# =============================================================================
-# IDE / Editors
-# =============================================================================
+# PyTorch checkpoints & model weights
+*.pt
+*.pth
+*.ckpt
+
+# Experiment outputs (large / generated)
+experiments/*/checkpoints/
+experiments/*/molecules/
+experiments/*/evaluation/
+experiments/*/plots/
+experiments/*/logs/
+experiments/*/*.log
+
+# SLURM logs
+logs/slurm_*.out
+logs/slurm_*.err
+
+# Data files (large)
+data/*.jsonl
+data/*.csv
+data/*.pkl
+data/*.hdf5
+data/*.h5
+
+# Generated SDF / PDB outputs
+*.sdf
+*.pdb
+*.mol
+*.mol2
+
+# OS / editor
+.DS_Store
+Thumbs.db
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-.spyderproject
-.spyproject
 
-# =============================================================================
-# Data Files (large files - don't push to git)
-# =============================================================================
-*.sdf
-*.mol2
-*.pdb
-*.xyz
-*.jsonl
-*.json
-!requirements.json
-!package.json
-*.csv
-*.pkl
-*.pickle
-*.h5
-*.hdf5
-*.npy
-*.npz
-
-# =============================================================================
-# Model Checkpoints (large files)
-# =============================================================================
-checkpoints/
-*.pt
-*.pth
-*.ckpt
-*.bin
-*.safetensors
-best_*.pt
-checkpoint_*.pt
-
-# =============================================================================
-# Logs and Outputs
-# =============================================================================
-logs/
-outputs/
-*.log
-slurm-*.out
-*.out
-
-# =============================================================================
-# Temporary Files
-# =============================================================================
-tmp/
-temp/
-.cache/
-*.tmp
-*.bak
-
-# =============================================================================
-# OS Files
-# =============================================================================
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# =============================================================================
-# Coverage and Testing
-# =============================================================================
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
+# Pytest / coverage
 .pytest_cache/
+.coverage
+htmlcov/
 
-# =============================================================================
-# Visualization Outputs
-# =============================================================================
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.pdf
-*.svg
-visualizations/
-
-# =============================================================================
-# Keep These (override above patterns)
-# =============================================================================
-!README.md
-!requirements.txt
-!setup.py
-!setup.cfg
-!pyproject.toml
-!.gitignore
-
-# =============================================================================
-# Experiment Folders — track scripts & config, ignore heavy outputs
-# =============================================================================
-# Allow experiment config.json and visualization scripts
-!experiments/**/config.json
-!experiments/**/visualization/*.py
-
-# Ignore heavy experiment outputs (checkpoints, plots, logs, eval data)
-experiments/**/checkpoints/
-experiments/**/plots/
-experiments/**/logs/
-experiments/**/evaluation/
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,22 @@
+{
+  "args": {
+    "data": "data/qm9_100k.jsonl",
+    "max_atoms": 50,
+    "val_split": 0.1,
+    "epochs": 300,
+    "batch_size": 64,
+    "lr": 0.0003,
+    "warmup": 5,
+    "resume": null,
+    "hidden_dim": 512,
+    "num_layers": 10,
+    "timesteps": 1000,
+    "edge_dim": 64,
+    "time_dim": 256,
+    "geometry_weight": 0.1,
+    "num_generate": 500,
+    "exp_dir": "/scratch/nishanth.r/nextmol_experiment/mol_next_gen/experiments/09-03-2026-Exp-3(stable_full_constraints)"
+  },
+  "experiment": "09-03-2026-Exp-3(stable_full_constraints)",
+  "date": "2026-03-10T08:21:08.130644"
+}

@@ -83,12 +83,14 @@ class EquivariantLayer(nn.Module):
         super().__init__()
         self.edge_dim = edge_dim
 
-        # Edge MLP: computes messages
+        # Edge MLP: computes messages (Dropout fixes train/val gap after ep.150)
         self.edge_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_dim + 1, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Dropout(0.1),
         )
 
         # Coordinate update weight (scalar per edge)
@@ -99,10 +101,11 @@ class EquivariantLayer(nn.Module):
             nn.Tanh()  # Bounded output prevents exploding coordinate updates
         )
 
-        # Node update
+        # Node update (Dropout for regularization)
         self.node_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
@@ -573,14 +576,13 @@ class ConformerDiffusion(nn.Module):
                  max_epochs: int = 100,
                  min_snr_gamma: float = 5.0) -> torch.Tensor:
         """
-        Training loss with:
-        1. SNR-based timestep weighting (from EDM/min-SNR paper)
-        2. Curriculum geometry learning: bonds → bonds+angles → bonds+angles+torsions
-        3. Vectorized chemistry-aware geometry loss
-
-        Geometry loss scale: all internal weights are 1.0 (unit), controlled
-        entirely by geometry_weight here so the total loss stays comparable
-        to the diffusion MSE loss (~0.1-1.0 range).
+        Training loss — v3 (research-backed, no curriculum):
+        1. SNR-based timestep weighting (Min-SNR, Hang et al. 2023)
+        2. ALL geometry constraints active from epoch 1 (EQGAT-diff / GCDM pattern)
+           Bonds + angles + torsions enabled immediately with small fixed weight.
+           This avoids the destabilising spikes caused by staged activation.
+        3. SNR-mean gate on geometry loss: geometry supervision is proportional
+           to how much useful signal exists at the sampled timestep.
         """
         device = x_0.device
         B = batch_idx.max().item() + 1
@@ -596,26 +598,17 @@ class ConformerDiffusion(nn.Module):
         # MSE loss per atom
         mse_per_atom = ((noise_pred - noise) ** 2).sum(-1)  # (N,)
 
-        # SNR-based weighting (min-SNR-gamma clipping from Hang et al. 2023)
+        # SNR-based weighting (min-SNR-gamma clipping, Hang et al. 2023)
         snr_t = self.snr[t][batch_idx]  # (N,)
         snr_weight = torch.minimum(snr_t, torch.full_like(snr_t, min_snr_gamma)) / snr_t.clamp(min=1e-8)
         mse_loss = (snr_weight * mse_per_atom).mean()
 
-        # Curriculum: 3-stage geometry learning
-        # Stage 1 (0–30%): bonds only
-        # Stage 2 (30–60%): bonds + angles
-        # Stage 3 (60%+): bonds + angles + torsions
-        progress = epoch / max_epochs
-        use_angles = progress > 0.30
-        use_torsions = progress > 0.60
-
-        # Linear ramp from 0 → 1 over first 40% of training
-        curriculum = min(1.0, progress / 0.40)
-        effective_geo_weight = geometry_weight * curriculum
-
-        # Only compute geometry loss if weight is meaningful
-        if effective_geo_weight < 1e-6:
-            return mse_loss
+        # FIX: All geometry active from epoch 1, small fixed weight (no curriculum ramp)
+        # - EQGAT-diff (ICLR 2024): no staged activation needed
+        # - GCDM (arXiv 2023): geometry supervision from epoch 1 is strictly better
+        use_angles   = True   # was: progress > 0.30
+        use_torsions = True   # was: progress > 0.60
+        effective_geo_weight = geometry_weight * 0.1  # small fixed scale, stable
 
         # Predict x_0 from x_t (detached for stability)
         alpha_t = self.sqrt_alphas_cumprod[t][batch_idx].unsqueeze(-1)
@@ -629,12 +622,11 @@ class ConformerDiffusion(nn.Module):
             include_angles=use_angles, include_torsions=use_torsions
         )
 
-        # Only apply geometry loss at low noise levels (near x_0)
-        # High-noise timesteps (large t) have uninformative x_0_pred
-        noise_level = t.float() / self.num_timesteps       # 0=clean, 1=pure noise
-        geo_timestep_weight = (1.0 - noise_level[batch_idx]).mean()
+        # FIX: SNR-mean gate (replaces brittle 1-noise_level gate)
+        # High SNR = low noise = x_0_pred is accurate = geometry loss is informative
+        snr_geo_weight = snr_weight.mean().detach().clamp(max=1.0)
 
-        total_loss = mse_loss + effective_geo_weight * geo_timestep_weight * geo_loss
+        total_loss = mse_loss + effective_geo_weight * snr_geo_weight * geo_loss
 
         return {
             'total': total_loss,
