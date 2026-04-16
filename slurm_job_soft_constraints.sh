@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=soft_constraints
-#SBATCH --output=/home2/nishanth.r/soft_constraints_%j.log
-#SBATCH --error=/home2/nishanth.r/soft_constraints_%j.log
+#SBATCH --output=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/soft_constraints_%j.log
+#SBATCH --error=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/soft_constraints_%j.log
 #SBATCH --partition=plafnet2
 #SBATCH --account=plafnet2
 #SBATCH --gres=gpu:1
@@ -27,7 +27,9 @@ echo "Date: $(date)"
 echo ""
 
 
-cd /scratch/nishanth.r/mol_next_gen
+PROJ=/scratch/nishanth.r/nextmol_experiment/mol_next_gen
+cd "$PROJ"
+mkdir -p logs
 source venv/bin/activate
 
 echo "Python: $(which python)"

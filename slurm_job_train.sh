@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nextmol_train
-#SBATCH --output=/home2/nishanth.r/nextmol_train_%j.log
-#SBATCH --error=/home2/nishanth.r/nextmol_train_%j.log
+#SBATCH --output=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_train_%j.log
+#SBATCH --error=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_train_%j.log
 #SBATCH --partition=plafnet2
 #SBATCH --account=plafnet2
 #SBATCH --gres=gpu:1
@@ -25,7 +25,9 @@ echo "Node     : $SLURM_NODELIST"
 echo "Start    : $(date)"
 echo "=========================================="
 
-cd /scratch/nishanth.r/mol_next_gen
+PROJ=/scratch/nishanth.r/nextmol_experiment/mol_next_gen
+cd "$PROJ"
+mkdir -p logs
 source venv/bin/activate
 
 echo "Python : $(which python)"
@@ -38,7 +40,7 @@ EPOCHS=200
 GEOMETRY_WEIGHT=0.1
 DATA="data/qm9_selfies.jsonl"
 CHECKPOINT_DIR="checkpoints"
-LOG_FILE="/home2/nishanth.r/nextmol_train_${SLURM_JOB_ID}.log"
+LOG_FILE="$PROJ/logs/nextmol_train_${SLURM_JOB_ID}.log"
 
 mkdir -p "$CHECKPOINT_DIR" plots
 

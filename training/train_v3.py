@@ -39,6 +39,9 @@ try:
 except ImportError:
     HAS_RDKIT = False
 
+# New molecular export utilities
+from evaluation.mol_export import export_molecule, write_sdf_rdkit, write_sdf
+
 
 # =============================================================================
 # RING / CHIRALITY DETECTION (graph-only, no RDKit)
@@ -166,19 +169,22 @@ BOND_TYPE_MAP = {
 
 def _build_graph_from_smiles(smiles):
     """
-    Build (edge_index [2, E], bond_types [E]) as undirected graph from SMILES.
-    Returns None, None if RDKit is unavailable or SMILES parsing fails.
-    SMILES in qm9_100k.jsonl have explicit H atoms, so we parse as-is.
+    Build (edge_index [2, E], bond_types [E], heavy_atom_indices [N_heavy]) from SMILES.
+
+    CRITICAL FIX: We use HEAVY-ATOM-ONLY representation.
+    - RDKit MolFromSmiles strips H by default → graph has only heavy atoms
+    - We also strip H from the coordinate/atom_type arrays in ConformerDataset
+    - This ensures edge_index atom counts match atom_types/coords exactly
+
+    Returns (edge_index, bond_types) or (None, None) on failure.
     """
     if not HAS_RDKIT or not smiles:
         return None, None
     try:
         from rdkit import Chem
-        # Keep explicit H atoms in SMILES (e.g. [H]O[H]) so atom count matches
-        mol = Chem.MolFromSmiles(smiles)
+        mol = Chem.MolFromSmiles(smiles)   # heavy atoms only (RDKit default)
         if mol is None:
             return None, None
-        # Map RDKit BondType enum to integer bond order
         BT_MAP = {
             Chem.BondType.SINGLE:   1,
             Chem.BondType.DOUBLE:   2,
@@ -195,37 +201,39 @@ def _build_graph_from_smiles(smiles):
         if not rows:
             return None, None
         edge_index = torch.tensor([rows, cols], dtype=torch.long)
-        bond_types = torch.tensor(btypes, dtype=torch.long)
+        bond_types  = torch.tensor(btypes,       dtype=torch.long)
         return edge_index, bond_types
     except Exception:
         return None, None
 
 
 def _fallback_full_graph(n_atoms):
-    """Fully connected graph with all bond types = 1 (fallback when no SMILES)."""
-    rows, cols = [], []
-    for i in range(n_atoms):
-        for j in range(n_atoms):
-            if i != j:
-                rows.append(i)
-                cols.append(j)
-    edge_index = torch.tensor([rows, cols], dtype=torch.long)
-    bond_types = torch.ones(len(rows), dtype=torch.long)
-    return edge_index, bond_types
+    """
+    REMOVED: fully-connected fallback graph was chemically invalid
+    (bonded every atom to every other with bond_type=1 — geometry loss
+    then wrongly penalized all non-bonded distances as if C-C single bonds).
+    Callers should skip molecules with no valid SMILES instead.
+    """
+    return None, None
 
 
 class ConformerDataset(Dataset):
     """
-    Reads qm9_100k.jsonl format:
-      - 'coords'     : list of 50 [x,y,z] (padded with zeros)
-      - 'atom_types' : list of 50 ints (padded with -1)
-      - 'coord_mask' : list of 50 ints (1=real atom, 0=padding)
-      - 'smiles'     : SMILES string (used to build graph topology)
+    Reads qm9_100k.jsonl format.
+
+    CRITICAL FIX: Uses HEAVY-ATOM-ONLY representation.
+    - Coordinates and atom_types for H atoms (atomic number = 1) are STRIPPED.
+    - The SMILES graph from RDKit also has heavy atoms only.
+    - This ensures edge_index atom indices align with atom_types/coords exactly.
+
+    If a molecule has no valid SMILES (no graph), it is SKIPPED entirely
+    (old fallback full graph was chemically wrong).
     """
     def __init__(self, data_path, max_atoms=50):
         self.data = []
         print(f"Loading data from {data_path}...")
         skipped = 0
+        no_smiles = 0
         with open(data_path) as f:
             for line in tqdm(f):
                 line = line.strip()
@@ -237,23 +245,21 @@ class ConformerDataset(Dataset):
                     skipped += 1
                     continue
 
-                # Support both old format ('coordinates') and new format ('coords')
-                coords_raw  = item.get('coords', item.get('coordinates'))
-                at_raw      = item.get('atom_types', [])
-                mask_raw    = item.get('coord_mask', None)
-                smiles      = item.get('smiles', '')
+                coords_raw = item.get('coords', item.get('coordinates'))
+                at_raw     = item.get('atom_types', [])
+                mask_raw   = item.get('coord_mask', None)
+                smiles     = item.get('smiles', '')
 
                 if coords_raw is None:
                     skipped += 1
                     continue
 
-                # Unpad using coord_mask
+                # Unpad using coord_mask or -1 sentinel
                 if mask_raw is not None:
-                    mask = [bool(m) for m in mask_raw]
-                    coords   = [c for c, m in zip(coords_raw, mask) if m]
-                    at       = [a for a, m in zip(at_raw, mask) if m]
+                    mask   = [bool(m) for m in mask_raw]
+                    coords = [c for c, m in zip(coords_raw, mask) if m]
+                    at     = [a for a, m in zip(at_raw,     mask) if m]
                 else:
-                    # Old format: use num_atoms or -1 sentinel
                     num_atoms = item.get('num_atoms', None)
                     if num_atoms is not None:
                         coords = coords_raw[:num_atoms]
@@ -262,19 +268,43 @@ class ConformerDataset(Dataset):
                         coords = [c for c, a in zip(coords_raw, at_raw) if a != -1]
                         at     = [a for a in at_raw if a != -1]
 
+                # CRITICAL FIX: strip hydrogen atoms so graph and coords match
+                heavy_pairs = [(a, c) for a, c in zip(at, coords) if a != 1]
+                if not heavy_pairs:
+                    skipped += 1
+                    continue
+                at     = [p[0] for p in heavy_pairs]
+                coords = [p[1] for p in heavy_pairs]
+
                 n = len(at)
                 if n == 0 or n > max_atoms:
                     skipped += 1
                     continue
 
+                # Require valid SMILES graph — skip if not available
+                edge_index, bond_types = _build_graph_from_smiles(smiles)
+                if edge_index is None:
+                    no_smiles += 1
+                    continue
+
+                # Sanity check: graph node count must match atom_types length
+                n_graph = int(edge_index.max().item()) + 1 if edge_index.numel() > 0 else 0
+                if n_graph > n:
+                    # Graph references more atoms than we have coords for — skip
+                    skipped += 1
+                    continue
+
                 self.data.append({
-                    'atom_types':  at,
-                    'coords':      coords,
-                    'smiles':      smiles,
-                    'num_atoms':   n,
+                    'atom_types': at,
+                    'coords':     coords,
+                    'smiles':     smiles,
+                    'num_atoms':  n,
+                    'edge_index': edge_index,
+                    'bond_types': bond_types,
                 })
 
-        print(f"Loaded {len(self.data)} molecules ({skipped} skipped)")
+        print(f"Loaded {len(self.data)} molecules "
+              f"({skipped} skipped, {no_smiles} no_smiles)")
 
     def __len__(self):
         return len(self.data)
@@ -283,12 +313,16 @@ class ConformerDataset(Dataset):
         item = self.data[idx]
         atom_types = torch.tensor(item['atom_types'], dtype=torch.long)
         coords     = torch.tensor(item['coords'],     dtype=torch.float32)
-        smiles     = item['smiles']
         n          = item['num_atoms']
 
-        edge_index, bond_types = _build_graph_from_smiles(smiles)
-        if edge_index is None:
-            edge_index, bond_types = _fallback_full_graph(n)
+        # Graph was pre-built and validated at load time
+        edge_index = item['edge_index']
+        bond_types = item['bond_types']
+
+        # Final length sanity check (should never fire after load-time check)
+        assert len(atom_types) == coords.size(0), (
+            f"atom_types ({len(atom_types)}) != coords ({coords.size(0)}) for idx {idx}"
+        )
 
         return {
             'atom_types':  atom_types,
@@ -296,7 +330,7 @@ class ConformerDataset(Dataset):
             'edge_index':  edge_index,
             'bond_types':  bond_types,
             'num_atoms':   n,
-            'smiles':      smiles,
+            'smiles':      item['smiles'],
         }
 
 
@@ -749,67 +783,66 @@ def export_valid_molecules(model, dataloader, device,
     if log:
         log.info(f"  Generated {total_gen} molecules, {len(valid_mols)} passed RDKit validation")
 
-    # ── SDF export ──────────────────────────────────────────────────────────
-    if sdf_path and valid_mols and HAS_RDKIT:
-        from rdkit.Chem import SDWriter
-        with SDWriter(str(sdf_path)) as w:
-            for mol in valid_mols:
-                w.write(mol)
-        if log:
-            log.info(f"  SDF saved  → {sdf_path}  ({len(valid_mols)} molecules)")
-
-    # ── PDB export: one clean file per molecule ──────────────────────────────
-    if pdb_dir and valid_mols and HAS_RDKIT:
-        pdb_dir = Path(pdb_dir)
-        pdb_dir.mkdir(parents=True, exist_ok=True)
-
-        combined_path = pdb_dir / 'all_molecules.pdb'
-        n_exported = 0
-        with open(str(combined_path), 'w') as combined_f:
+    # ── High-Fidelity Export (MOL2, PDB, SDF) ────────────────────────────────
+    if valid_mols and HAS_RDKIT:
+        export_dir = Path(pdb_dir).parent if pdb_dir else Path(sdf_path).parent if sdf_path else None
+        
+        if export_dir:
+            mol_dir = export_dir / 'exported_molecules'
+            mol_dir.mkdir(parents=True, exist_ok=True)
+            
+            n_exported = 0
             for idx, mol in enumerate(valid_mols):
                 try:
-                    pdb_block = Chem.MolToPDBBlock(mol)
-                    mol_name  = mol.GetProp('_Name') if mol.HasProp('_Name') else f'mol_{idx+1:04d}'
-                    smi       = mol.GetProp('SMILES') if mol.HasProp('SMILES') else ''
-
-                    # ── Individual clean PDB (no MODEL/ENDMDL — VMD-safe) ───
-                    ind_path = pdb_dir / f'{mol_name}.pdb'
-                    with open(str(ind_path), 'w') as f:
-                        f.write(f"REMARK SMILES {smi}\n")
-                        # Strip MODEL/ENDMDL lines from pdb_block
-                        for line in pdb_block.splitlines(keepends=True):
-                            if not (line.startswith('MODEL') or line.startswith('ENDMDL')):
-                                f.write(line)
-
-                    # ── Combined (still useful for bulk loading) ────────────
-                    combined_f.write(f"MODEL     {idx+1}\n")
-                    combined_f.write(f"REMARK SMILES {smi}\n")
-                    combined_f.write(pdb_block)
-                    combined_f.write("ENDMDL\n")
+                    # Get atom coords and types from RDKit mol
+                    conf = mol.GetConformer()
+                    pos = torch.tensor(conf.GetPositions(), dtype=torch.float32)
+                    atom_types = torch.tensor([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=torch.long)
+                    
+                    # Reconstruction of edge_index and bond_types for the writers
+                    rows, cols, bts = [], [], []
+                    for bond in mol.GetBonds():
+                        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+                        bo_map = {Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, 
+                                  Chem.BondType.TRIPLE: 3, Chem.BondType.AROMATIC: 4}
+                        bo = bo_map.get(bond.GetBondType(), 1)
+                        rows.extend([i, j]); cols.extend([j, i]); bts.extend([bo, bo])
+                    
+                    ei = torch.tensor([rows, cols], dtype=torch.long)
+                    bt = torch.tensor(bts, dtype=torch.long)
+                    
+                    # Single call to the new robust export pipeline
+                    export_molecule(
+                        pos, atom_types, ei, bt,
+                        out_dir=str(mol_dir),
+                        mol_idx=idx + 1,
+                        formats=['sdf', 'pdb', 'mol2'],
+                        mol_name=mol.GetProp('_Name') if mol.HasProp('_Name') else f'M{idx+1:03d}'
+                    )
                     n_exported += 1
-                except Exception:
+                except Exception as e:
                     continue
 
-        # ── VMD Tcl loader script ───────────────────────────────────────────
-        tcl_path = pdb_dir.parent / 'load_all_vmd.tcl'
-        tcl_lines = [
-            "# load_all_vmd.tcl — generated by train_v3.py",
-            "# Usage: vmd -e load_all_vmd.tcl",
-            "# Or inside VMD console: source load_all_vmd.tcl",
-            "# Loads every mol_NNNN.pdb as a SEPARATE molecule (not a trajectory)",
-            "",
-        ]
-        for i in range(1, n_exported + 1):
-            tcl_lines.append(f"mol new {{pdb_files/mol_{i:04d}.pdb}} type pdb")
-        tcl_path.write_text("\n".join(tcl_lines) + "\n")
+            # Update combined SDF for compatibility
+            if sdf_path:
+                with Chem.SDWriter(str(sdf_path)) as w:
+                    for mol in valid_mols:
+                        w.write(mol)
 
-        if log:
-            log.info(f"  PDB files  → {pdb_dir}/mol_NNNN.pdb  ({n_exported} files)")
-            log.info(f"  Combined   → {combined_path}")
-            log.info(f"  VMD loader → {tcl_path}")
-    elif pdb_dir and not HAS_RDKIT:
-        if log:
-            log.warning("  RDKit not available — skipping PDB export")
+            # Update VMD loader
+            tcl_path = mol_dir.parent / 'load_all_vmd.tcl'
+            tcl_lines = [
+                "# load_all_vmd.tcl — updated for structured export",
+                f"# Found {n_exported} valid molecules",
+                "",
+            ]
+            for i in range(1, n_exported + 1):
+                tcl_lines.append(f"mol new {{exported_molecules/mol_{i:04d}.pdb}} type pdb")
+            tcl_path.write_text("\n".join(tcl_lines) + "\n")
+
+            if log:
+                log.info(f"  Clean export → {mol_dir}  ({n_exported} mols in SDF, PDB, MOL2)")
+                log.info(f"  VMD loader   → {tcl_path}")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     if valid_mols and HAS_RDKIT:
@@ -901,11 +934,12 @@ def main():
     parser.add_argument('--hidden_dim', type=int,   default=512)
     parser.add_argument('--num_layers', type=int,   default=10)
     parser.add_argument('--timesteps',  type=int,   default=1000)
-    parser.add_argument('--edge_dim',   type=int,   default=64)
+    parser.add_argument('--num_rbf',    type=int,   default=20,
+                        help='Number of RBF Gaussian basis functions for edge distances')
     parser.add_argument('--time_dim',   type=int,   default=256)
     # Geometry
-    parser.add_argument('--geometry_weight', type=float, default=0.1,
-                        help='Base geometry weight (fixed, no curriculum)')
+    parser.add_argument('--geometry_weight', type=float, default=1.0,
+                        help='Geometry loss weight (applied at ALL timesteps, no gating)')
     parser.add_argument('--num_generate',    type=int,   default=500)
     # Experiment
     parser.add_argument('--exp_dir',    type=str,   default=DEFAULT_EXP_DIR)
@@ -960,19 +994,22 @@ def main():
         num_timesteps=args.timesteps,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
-        edge_dim=args.edge_dim,
+        num_rbf=args.num_rbf,
         time_dim=args.time_dim,
     ).to(device)
 
-    # Override geometry weights (all constraints active, balanced weights)
+    # Geometry constraints — ALL weights are meaningful now (repulsion is per-mol)
+    # Bond weight high: bond lengths are the primary geometry target
+    # Angle weight: second most important
+    # Repulsion: prevent steric clashes (now actually runs for QM9 molecules)
     model.geometry = GeometryConstraints(
-        bond_weight=1.0,
-        angle_weight=0.5,
-        torsion_weight=0.2,
-        repulsion_weight=0.5,
-        planarity_weight=0.5,   # active from epoch 1
-        chirality_weight=0.3,
-        ring_strain_weight=0.2,
+        bond_weight=10.0,
+        angle_weight=3.0,
+        torsion_weight=0.5,
+        repulsion_weight=5.0,
+        planarity_weight=3.0,
+        chirality_weight=0.0,   # disabled — chirality sign detection is unreliable
+        ring_strain_weight=1.0,
     )
 
     log.info(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")

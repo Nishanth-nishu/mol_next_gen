@@ -163,33 +163,46 @@ class NExTMolGenerator:
         
         coords = coords.cpu().numpy()
         result['method'] = 'diffusion_guided'
-        
+
         # Add coordinates to mol
         result['coordinates'] = coords.tolist()
-        
+
         # Create final mol with coordinates
+        # CRITICAL FIX: We generated coords for HEAVY ATOMS ONLY (matching the training
+        # data pipeline).  MolFromSmiles also gives heavy-atom-only mol. So the
+        # atom counts must match exactly — no truncation or padding needed.
         try:
-            # Create new mol from SMILES and add conformer
             final_mol = Chem.MolFromSmiles(result['smiles'])
             if final_mol is None:
                 return result
-            
-            conf = Chem.Conformer(final_mol.GetNumAtoms())
-            for i in range(min(len(coords), final_mol.GetNumAtoms())):
+
+            n_heavy = final_mol.GetNumAtoms()
+            n_gen   = len(coords)
+
+            if n_gen != n_heavy:
+                # Mismatch — graph and generated coords don't align. Skip 3D but
+                # topology is still valid.
+                result['valid'] = True
+                result['error'] = (
+                    f'Coord count mismatch: generated {n_gen} coords '
+                    f'but molecule has {n_heavy} heavy atoms'
+                )
+                return result
+
+            conf = Chem.Conformer(n_heavy)
+            for i in range(n_heavy):
                 conf.SetAtomPosition(i, coords[i].tolist())
             final_mol.AddConformer(conf)
-            
-            # Sanitize
+
             Chem.SanitizeMol(final_mol)
-            
-            result['mol'] = final_mol
+
+            result['mol']   = final_mol
             result['valid'] = True
-            
+
         except Exception as e:
-            # Even if coordinate assignment fails, topology was valid
-            result['valid'] = True  # Topology is still valid!
+            result['valid'] = True   # Topology is still valid
             result['error'] = str(e)
-        
+
         return result
     
     def generate(self, 

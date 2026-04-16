@@ -33,21 +33,13 @@ ln -sf "$PROJ/logs/slurm_v3_${SLURM_JOB_ID}.out" "$EXP_DIR/logs/slurm_${SLURM_JO
 ln -sf "$PROJ/logs/slurm_v3_${SLURM_JOB_ID}.err" "$EXP_DIR/logs/slurm_${SLURM_JOB_ID}.err" 2>/dev/null || true
 
 # ── Python virtual environment (pip, no conda) ──────────────────────────────
-VENV=/scratch/nishanth.r/nextmol_venv
+VENV="$PROJ/venv"
 
 if [ ! -d "$VENV" ]; then
-    echo "Creating venv at $VENV ..."
-    python3 -m venv "$VENV"
-    echo "Installing requirements (--no-cache-dir into scratch) ..."
-    "$VENV/bin/pip" install --no-cache-dir --upgrade pip
-    "$VENV/bin/pip" install --no-cache-dir \
-        'torch>=2.0' \
-        rdkit \
-        'selfies>=2.1.0' \
-        'transformers>=4.30.0' \
-        tqdm pandas numpy matplotlib
-else
-    echo "Reusing existing venv at $VENV"
+    echo "ERROR: Virtual environment not found at $VENV"
+    echo "Please create it first from the project root:"
+    echo "  python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    exit 1
 fi
 
 source "$VENV/bin/activate"
@@ -69,9 +61,9 @@ python3 training/train_v3.py \
     --hidden_dim   512 \
     --num_layers   10 \
     --timesteps    1000 \
-    --edge_dim     64 \
+    --num_rbf      20 \
     --time_dim     256 \
-    --geometry_weight  0.1 \
+    --geometry_weight  1.0 \
     --num_generate 500 \
     --exp_dir      "$EXP_DIR"
 

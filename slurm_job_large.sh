@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nextmol_large
-#SBATCH --output=/home2/nishanth.r/nextmol_large_%j.log
-#SBATCH --error=/home2/nishanth.r/nextmol_large_%j.log
+#SBATCH --output=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_large_%j.log
+#SBATCH --error=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_large_%j.log
 #SBATCH --partition=plafnet2
 #SBATCH --account=plafnet2
 #SBATCH --gres=gpu:1
@@ -35,7 +35,9 @@ echo "Node     : $SLURM_NODELIST"
 echo "Start    : $(date)"
 echo "=========================================="
 
-cd /scratch/nishanth.r/mol_next_gen
+PROJ=/scratch/nishanth.r/nextmol_experiment/mol_next_gen
+cd "$PROJ"
+mkdir -p logs
 source venv/bin/activate
 
 echo "Python : $(which python)"
@@ -150,7 +152,7 @@ echo "STAGE 5: Rendering training dashboard"
 echo "============================================================================"
 
 python visualization/train_dashboard.py \
-    --log    /home2/nishanth.r/nextmol_large_${SLURM_JOB_ID}.log \
+    --log    "$PROJ/logs/nextmol_large_${SLURM_JOB_ID}.log" \
     --output plots/large/
 
 echo "  Dashboard saved to plots/large/"

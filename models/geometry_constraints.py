@@ -123,12 +123,63 @@ BOND_LENGTH_DICT = {
     (1, 16, 1): 1.34,
     # S-S
     (16, 16, 1): 2.05,
-    # S-N
+    # S-N (sulfonamide)
     (16, 7, 1): 1.65,
     (7, 16, 1): 1.65,
     # S-O
     (16, 8, 2): 1.44,
     (8, 16, 2): 1.44,
+    (16, 8, 1): 1.58,
+    (8, 16, 1): 1.58,
+    # P-C (organophosphorus)
+    (15, 6, 1): 1.84,
+    (6, 15, 1): 1.84,
+    # P-N
+    (15, 7, 1): 1.68,
+    (7, 15, 1): 1.68,
+    # P-O (phosphate, common in nucleotides)
+    (15, 8, 1): 1.63,
+    (8, 15, 1): 1.63,
+    (15, 8, 2): 1.48,
+    (8, 15, 2): 1.48,
+    # P-S
+    (15, 16, 1): 1.95,
+    (16, 15, 1): 1.95,
+    # P-H
+    (15, 1, 1): 1.44,
+    (1, 15, 1): 1.44,
+    # P-F
+    (15, 9, 1): 1.55,
+    (9, 15, 1): 1.55,
+    # Si-C
+    (14, 6, 1): 1.86,
+    (6, 14, 1): 1.86,
+    # Si-H
+    (14, 1, 1): 1.47,
+    (1, 14, 1): 1.47,
+    # Si-O
+    (14, 8, 1): 1.65,
+    (8, 14, 1): 1.65,
+    # Si-N
+    (14, 7, 1): 1.74,
+    (7, 14, 1): 1.74,
+    # Si-Si
+    (14, 14, 1): 2.33,
+    # B-C
+    (5, 6, 1): 1.57,
+    (6, 5, 1): 1.57,
+    # B-N
+    (5, 7, 1): 1.40,
+    (7, 5, 1): 1.40,
+    # B-O
+    (5, 8, 1): 1.38,
+    (8, 5, 1): 1.38,
+    # B-H
+    (5, 1, 1): 1.19,
+    (1, 5, 1): 1.19,
+    # N-S (sulfonamide N)
+    (7, 16, 2): 1.54,
+    (16, 7, 2): 1.54,
 }
 
 # Default bond lengths by bond order (fallback when pair not in table)
@@ -326,48 +377,57 @@ class GeometryConstraints:
                            batch_idx: torch.Tensor) -> torch.Tensor:
         """
         Bond angle loss with hybridization-aware targets.
-        Uses atom type + bond types to correctly identify sp/sp2/sp3.
+
+        FIX: Build angle triplets (i, j, k) with per-center ideal angles as tensors,
+        then compute ALL angles in a single vectorized GPU operation.
+        Replaces the O(N × deg²) Python loop that stalls the GPU.
         """
         device = pos.device
         N = pos.size(0)
         row, col = edge_index
 
-        # Build adjacency: for each atom j, store (neighbor_idx, bond_type)
-        neighbors = [[] for _ in range(N)]
-        neighbor_bonds = [[] for _ in range(N)]
+        # Build adjacency (still one Python scan — unavoidable for triplet building)
+        neighbors       = [[] for _ in range(N)]
+        neighbor_bonds  = [[] for _ in range(N)]
         for e in range(row.size(0)):
-            i, j = row[e].item(), col[e].item()
-            neighbors[j].append(i)
-            neighbor_bonds[j].append(bond_types[e].item())
+            i_e, j_e = row[e].item(), col[e].item()
+            neighbors[j_e].append(i_e)
+            neighbor_bonds[j_e].append(bond_types[e].item())
 
-        angle_losses = []
+        # Collect triplets and ideal angles as lists → convert to tensors once
+        tri_i, tri_j, tri_k, ideals = [], [], [], []
 
         for j in range(N):
             neigh = neighbors[j]
             if len(neigh) < 2:
                 continue
-
-            atom_num = atom_types[j].item()
-            hyb = detect_hybridization(j, atom_num, neigh, neighbor_bonds[j])
-            ideal_angle = math.radians(IDEAL_ANGLES[hyb])
+            atom_num   = atom_types[j].item()
+            hyb        = detect_hybridization(j, atom_num, neigh, neighbor_bonds[j])
+            ideal_rad  = math.radians(IDEAL_ANGLES[hyb])
 
             for idx_i, i in enumerate(neigh):
                 for k in neigh[idx_i + 1:]:
-                    v1 = pos[i] - pos[j]
-                    v2 = pos[k] - pos[j]
+                    tri_i.append(i)
+                    tri_j.append(j)
+                    tri_k.append(k)
+                    ideals.append(ideal_rad)
 
-                    cos_angle = F.cosine_similarity(
-                        v1.unsqueeze(0), v2.unsqueeze(0)
-                    ).clamp(-0.9999, 0.9999)
-
-                    angle = torch.acos(cos_angle)
-                    angle_error = (angle - ideal_angle) ** 2
-                    angle_losses.append(angle_error)
-
-        if len(angle_losses) == 0:
+        if not tri_i:
             return torch.tensor(0.0, device=device)
 
-        loss = torch.stack(angle_losses).mean()
+        # Vectorized angle computation — single GPU kernel
+        ti  = torch.tensor(tri_i, dtype=torch.long, device=device)
+        tj  = torch.tensor(tri_j, dtype=torch.long, device=device)
+        tk  = torch.tensor(tri_k, dtype=torch.long, device=device)
+        tgt = torch.tensor(ideals, dtype=pos.dtype, device=device)
+
+        v1 = pos[ti] - pos[tj]   # (T, 3)
+        v2 = pos[tk] - pos[tj]   # (T, 3)
+
+        cos_a = F.cosine_similarity(v1, v2, dim=-1).clamp(-0.9999, 0.9999)  # (T,)
+        angles = torch.acos(cos_a)                                            # (T,)
+
+        loss = ((angles - tgt) ** 2).mean()
         return self.angle_weight * loss
 
     def compute_torsion_loss(self,
@@ -449,73 +509,79 @@ class GeometryConstraints:
                                edge_index: torch.Tensor,
                                batch_idx: torch.Tensor) -> torch.Tensor:
         """
-        Steric repulsion loss — FIXED to exclude 1-2 AND 1-3 pairs.
-        
-        1-2 pairs: directly bonded (excluded from repulsion — these are handled by bond loss)
-        1-3 pairs: A-B-C where B is central (naturally ~2.4Å — NOT a clash)
-        1-4+ pairs: penalize if closer than VDW sum threshold
-        
-        Uses atom-type-specific VDW radii for threshold.
+        Steric repulsion loss — computed PER MOLECULE to fix the N>300 skip bug.
+
+        BUG FIX: Old code checked `if N > 300: skip` where N is the WHOLE BATCH
+        (64 molecules × ~15 atoms = 960 atoms → always skipped!).  Now we loop
+        over molecules and only compute repulsion for each molecule individually.
+        QM9 molecules have ≤ 29 heavy atoms, so per-mol N ≤ 29 is always fast.
+
+        Excludes:
+          1-2 pairs (bonded) — handled by bond loss
+          1-3 pairs (A-B-C)  — natural geometry, not clashes
         """
         device = pos.device
-        N = pos.size(0)
         row, col = edge_index
+        B = int(batch_idx.max().item()) + 1
 
-        if N > 300:
-            # For very large batches, skip repulsion (too expensive)
+        mol_losses = []
+
+        for mol_b in range(B):
+            mol_mask = (batch_idx == mol_b)
+            N_mol = int(mol_mask.sum().item())
+
+            if N_mol < 2:
+                continue
+
+            mol_pos = pos[mol_mask]                    # (N_mol, 3)
+            mol_at  = atom_types[mol_mask]             # (N_mol,)
+
+            # Local edge_index for this molecule
+            edge_mask = mol_mask[row] & mol_mask[col]
+            if not edge_mask.any():
+                continue
+
+            # Re-index edges to local 0-based indices
+            local_map = torch.full((pos.size(0),), -1, dtype=torch.long, device=device)
+            local_map[mol_mask.nonzero(as_tuple=True)[0]] = torch.arange(N_mol, device=device)
+            local_row = local_map[row[edge_mask]]
+            local_col = local_map[col[edge_mask]]
+
+            # Build 1-2 mask (bonded)
+            bonded_12 = torch.zeros(N_mol, N_mol, device=device, dtype=torch.bool)
+            bonded_12[local_row, local_col] = True
+
+            # Build 1-3 mask via adjacency matmul
+            adj_f = bonded_12.float()
+            bonded_13 = (adj_f @ adj_f).bool() & ~bonded_12 & ~torch.eye(N_mol, device=device, dtype=torch.bool)
+
+            excluded = bonded_12 | bonded_13 | torch.eye(N_mol, device=device, dtype=torch.bool)
+            nb_mask = ~excluded
+
+            if not nb_mask.any():
+                continue
+
+            all_dists = torch.cdist(mol_pos, mol_pos)   # (N_mol, N_mol)
+
+            atom_vdw = torch.tensor(
+                [VDW_RADII.get(a.item(), DEFAULT_VDW) for a in mol_at],
+                device=device, dtype=pos.dtype
+            )
+            vdw_thresh = (atom_vdw.unsqueeze(0) + atom_vdw.unsqueeze(1)) * 0.70
+
+            nb_dists  = all_dists[nb_mask]
+            thresh    = vdw_thresh[nb_mask]
+
+            clashing = nb_dists < thresh
+            if clashing.any():
+                clash_dists  = nb_dists[clashing]
+                clash_thresh = thresh[clashing]
+                mol_losses.append(torch.mean((clash_thresh - clash_dists) ** 2))
+
+        if not mol_losses:
             return torch.tensor(0.0, device=device)
 
-        # Build 1-2 mask (directly bonded)
-        bonded_12 = torch.zeros(N, N, device=device, dtype=torch.bool)
-        bonded_12[row, col] = True
-
-        # Build 1-3 mask (bonded through one atom)
-        # If i-j and j-k are bonds, then i-k is a 1-3 pair
-        bonded_13 = torch.zeros(N, N, device=device, dtype=torch.bool)
-        # For each atom j, connect all its neighbors pairwise
-        for j in range(N):
-            j_neighbors = col[row == j]
-            if len(j_neighbors) >= 2:
-                for ni in j_neighbors:
-                    for nk in j_neighbors:
-                        if ni != nk:
-                            bonded_13[ni, nk] = True
-
-        # Excluded pairs: 1-2 or 1-3
-        excluded = bonded_12 | bonded_13 | torch.eye(N, device=device, dtype=torch.bool)
-
-        # Same-molecule mask
-        same_mol = batch_idx.unsqueeze(0) == batch_idx.unsqueeze(1)
-
-        # Non-bonded 1-4+ pairs within same molecule
-        nb_mask = same_mol & ~excluded
-
-        if not nb_mask.any():
-            return torch.tensor(0.0, device=device)
-
-        all_dists = torch.cdist(pos, pos)
-
-        # Use atom-type-aware min distance
-        # Simplified: use per-atom VDW radius to build threshold matrix
-        atom_vdw = torch.tensor(
-            [VDW_RADII.get(a.item(), DEFAULT_VDW) for a in atom_types],
-            device=device, dtype=pos.dtype
-        )
-        # Min dist matrix: (ri + rj) * 0.70
-        vdw_thresh = (atom_vdw.unsqueeze(0) + atom_vdw.unsqueeze(1)) * 0.70
-
-        # Soft repulsion: penalize distances below VDW threshold
-        nb_dists = all_dists[nb_mask]
-        thresh = vdw_thresh[nb_mask]
-
-        clashing = nb_dists < thresh
-        if not clashing.any():
-            return torch.tensor(0.0, device=device)
-
-        clash_dists = nb_dists[clashing]
-        clash_thresh = thresh[clashing]
-        loss = torch.mean((clash_thresh - clash_dists) ** 2)
-
+        loss = torch.stack(mol_losses).mean()
         return self.repulsion_weight * loss
 
     # =========================================================================

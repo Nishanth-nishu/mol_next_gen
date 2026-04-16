@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nextmol_ddim500
-#SBATCH --output=/home2/nishanth.r/nextmol_ddim500_%j.log
-#SBATCH --error=/home2/nishanth.r/nextmol_ddim500_%j.log
+#SBATCH --output=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_ddim500_%j.log
+#SBATCH --error=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_ddim500_%j.log
 #SBATCH --partition=plafnet2
 #SBATCH --account=plafnet2
 #SBATCH --gres=gpu:1
@@ -28,7 +28,9 @@ echo "Node     : $SLURM_NODELIST"
 echo "Start    : $(date)"
 echo "=========================================="
 
-cd /scratch/nishanth.r/mol_next_gen
+PROJ=/scratch/nishanth.r/nextmol_experiment/mol_next_gen
+cd "$PROJ"
+mkdir -p logs
 source venv/bin/activate
 
 echo "Python : $(which python)"
@@ -88,7 +90,7 @@ echo "==========================================================================
 echo "STAGE 3: Rendering training dashboard"
 echo "============================================================================"
 
-LOG_FILE=$(ls /home2/nishanth.r/nextmol_*.log 2>/dev/null | sort | tail -1)
+LOG_FILE=$(ls "$PROJ"/logs/nextmol_*.log 2>/dev/null | sort | tail -1)
 if [ -n "$LOG_FILE" ]; then
     python visualization/train_dashboard.py \
         --log    "$LOG_FILE" \

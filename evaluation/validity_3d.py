@@ -335,9 +335,15 @@ class Evaluator3D:
             batch_idx   = batch['batch_idx'].to(self.device)
 
             # Centre ground truth
-            from torch_scatter import scatter_mean as _scatter_mean
-            coords_true = coords_true - _scatter_mean(
-                coords_true, batch_idx, dim=0)[batch_idx]
+            # Centre ground truth per-molecule (inline scatter_mean — no torch_scatter required)
+            B_local = int(batch_idx.max().item()) + 1
+            com = torch.zeros(B_local, 3, device=self.device)
+            cnt = torch.zeros(B_local, device=self.device)
+            cnt.scatter_add_(0, batch_idx, torch.ones(batch_idx.size(0), device=self.device))
+            com.scatter_add_(0, batch_idx.unsqueeze(-1).expand(-1, 3), coords_true)
+            com = com / cnt.unsqueeze(1).clamp(min=1)
+            coords_true = coords_true - com[batch_idx]
+
 
             # Generate ONE conformer per molecule (for RMSD)
             try:

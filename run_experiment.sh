@@ -45,27 +45,17 @@ module load cuda/11.8 2>/dev/null || module load cuda 2>/dev/null || true
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
 
-INSTALL_DIR="/scratch/nishanth.r/miniconda3"
-ENV_NAME="nextmol"
+# Activate project-local virtual environment (stored in scratch)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$SCRIPT_DIR/venv"
 
-# Activate conda
-CONDA_SH="$INSTALL_DIR/etc/profile.d/conda.sh"
-
-if [ -f "$CONDA_SH" ]; then
-    source "$CONDA_SH"
-    conda activate $ENV_NAME
-else
-    echo "Warning: Conda script not found at $CONDA_SH"
-    
-    # Check if conda is reachable
-    if command -v conda &> /dev/null; then
-        echo "Using 'conda' from PATH..."
-        # Try to activate, but don't exit on failure (might rely on shell hook)
-        conda activate $ENV_NAME || echo "Warning: 'conda activate' returned error. Assuming environment is already set."
-    else
-        echo "Warning: 'conda' command not found. Assuming environment is already active."
-    fi
+if [ ! -d "$VENV" ]; then
+    echo "ERROR: Virtual environment not found at $VENV"
+    echo "Please create it first: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    exit 1
 fi
+
+source "$VENV/bin/activate"
 
 echo "Python: $(which python)"
 echo "CUDA visible: $CUDA_VISIBLE_DEVICES"

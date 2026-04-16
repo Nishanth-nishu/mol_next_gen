@@ -6,3 +6,7 @@ tqdm
 pandas
 numpy
 matplotlib
+scipy
+# torch-scatter must be installed separately to match your CUDA/torch version.
+# See: https://github.com/rusty1s/pytorch_scatter
+# The codebase includes an inline scatter_mean fallback if not installed.

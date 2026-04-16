@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nextmol
-#SBATCH --output=/home2/nishanth.r/nextmol_%j.log
-#SBATCH --error=/home2/nishanth.r/nextmol_%j.log
+#SBATCH --output=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_%j.log
+#SBATCH --error=/scratch/nishanth.r/nextmol_experiment/mol_next_gen/logs/nextmol_%j.log
 #SBATCH --partition=plafnet2
 #SBATCH --account=plafnet2
 #SBATCH --gres=gpu:1
@@ -26,7 +26,9 @@ echo "Date: $(date)"
 echo ""
 
 
-cd /scratch/nishanth.r/mol_next_gen
+PROJ=/scratch/nishanth.r/nextmol_experiment/mol_next_gen
+cd "$PROJ"
+mkdir -p logs
 source venv/bin/activate
 
 echo "Python: $(which python)"
